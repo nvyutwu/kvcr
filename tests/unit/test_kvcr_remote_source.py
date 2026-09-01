@@ -24,7 +24,16 @@ from _kvcr_test_utils import (
     _wait_until,
 )
 
-from kvcr import DURATION_METRIC, TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import (
+    BLOCKS_CANCELLED_METRIC,
+    DURATION_METRIC,
+    SOURCE_BLOCKS_AVAILABLE_METRIC,
+    SOURCE_BLOCKS_MISSING_METRIC,
+    TRANSFER_BLOCKS_FAILED_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BLOCKS_SUBMITTED_METRIC,
+    TRANSFER_BYTES_METRIC,
+)
 from kvcr.config import KVCRConfig
 from kvcr.types import BlockKey, PinRequestId
 
@@ -106,7 +115,13 @@ def test_kvcr_close_cleans_pending_pin_operations():
 def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
     source_agent = FakeNixlAgent(metadata=b"source-md")
     control = FakeBytesControl()
-    _new_kvcr(source_agent, FakePrimaryPinning(), control, name="source")
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
+        name="source",
+    )
     control.incoming.append(
         msgspec.msgpack.encode(
             {
@@ -125,7 +140,18 @@ def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):
         "type": "write_done",
         "op_handle": 6,
         "success": False,
+        "inventory_mismatch_reason": "layout_mismatch",
     }
+    expected_mismatch = (
+        "counter",
+        SOURCE_BLOCKS_MISSING_METRIC,
+        1,
+        ("layout_mismatch",),
+    )
+    assert list(source.poll_completed()) == []
+    stats = source.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert expected_mismatch in stats.records
     assert any(
         "malformed start_write" in record.getMessage()
         for record in kvcr_caplog.records
@@ -142,13 +168,16 @@ def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
     control = FakeBytesControl()
     kvcr = _new_kvcr(
         source_agent,
-        FakePrimaryPinning(prefix_length=0),
+        FakePrimaryPinning(),
         control,
+        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
         name="source",
     )
     control.incoming.append(
         _start_write_message(7, BlockKey(b"k0"), target_agent="target")
     )
+    assert _poll_until(kvcr, lambda _: bool(source_agent.xfers)) == []
+    source_agent.state = "ERR"
     assert (
         _poll_until(
             kvcr,
@@ -165,6 +194,133 @@ def test_kvcr_notification_send_failure_is_logged(kvcr_caplog):
         for record in kvcr_caplog.records
         if record.levelno == logging.WARNING
     )
+    expected_failure = (
+        "counter",
+        TRANSFER_BLOCKS_FAILED_METRIC,
+        1,
+        ("transport",),
+    )
+    assert _poll_until(kvcr, lambda _: not _has_outstanding_operations(kvcr)) == []
+    stats = kvcr.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        SOURCE_BLOCKS_AVAILABLE_METRIC,
+        1,
+        (),
+    ) in stats.records
+    assert (
+        "counter",
+        TRANSFER_BLOCKS_SUBMITTED_METRIC,
+        1,
+        (),
+    ) in stats.records
+    assert expected_failure in stats.records
+
+
+def test_kvcr_missing_source_is_counted_when_terminal_notification_is_lost(
+    kvcr_caplog,
+) -> None:
+    class FailingNotificationAgent(FakeNixlAgent):
+        def send_notif(self, agent_name, notif_msg):
+            raise RuntimeError("notification failed")
+
+    source_agent = FailingNotificationAgent(metadata=b"source-md")
+    control = FakeBytesControl()
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(prefix_length=0),
+        control,
+        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
+        name="source",
+    )
+    control.incoming.append(
+        _start_write_message(8, BlockKey(b"missing"), target_agent="target")
+    )
+
+    assert (
+        _poll_until(
+            source,
+            lambda _: any(
+                "write_done notification failed" in record.getMessage()
+                for record in kvcr_caplog.records
+            ),
+        )
+        == []
+    )
+    stats = source.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        SOURCE_BLOCKS_MISSING_METRIC,
+        1,
+        ("source_missing",),
+    ) in stats.records
+    assert not any(
+        record[0] == "counter"
+        and record[1]
+        in {
+            SOURCE_BLOCKS_AVAILABLE_METRIC,
+            TRANSFER_BLOCKS_SUBMITTED_METRIC,
+            TRANSFER_BLOCKS_METRIC,
+            TRANSFER_BLOCKS_FAILED_METRIC,
+            BLOCKS_CANCELLED_METRIC,
+        }
+        for record in stats.records
+    )
+
+
+def test_kvcr_source_setup_failure_is_pre_transport_unavailable(
+    kvcr_caplog,
+) -> None:
+    class FailingSetupAgent(FakeNixlAgent):
+        def add_remote_agent(self, metadata):
+            raise RuntimeError("peer setup failed")
+
+    source_agent = FailingSetupAgent(metadata=b"source-md")
+    control = FakeBytesControl()
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
+        name="source",
+    )
+    control.incoming.append(
+        _start_write_message(9, BlockKey(b"setup"), target_agent="target")
+    )
+
+    assert (
+        _poll_until(
+            source,
+            lambda _: any(
+                "start_write setup failed" in record.getMessage()
+                for record in kvcr_caplog.records
+            ),
+        )
+        == []
+    )
+    stats = source.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        SOURCE_BLOCKS_MISSING_METRIC,
+        1,
+        ("worker_unreachable",),
+    ) in stats.records
+    assert not any(
+        record[0] == "counter"
+        and record[1]
+        in {
+            SOURCE_BLOCKS_AVAILABLE_METRIC,
+            TRANSFER_BLOCKS_SUBMITTED_METRIC,
+            TRANSFER_BLOCKS_METRIC,
+            TRANSFER_BLOCKS_FAILED_METRIC,
+            BLOCKS_CANCELLED_METRIC,
+        }
+        for record in stats.records
+    )
+    assert source_agent.sent_notifs == []
 
 
 @pytest.mark.parametrize("failure", ["initialize", "error", "exception"])

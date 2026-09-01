@@ -82,7 +82,7 @@ def test_remote_request_stage_deduplicates_logical_physical_groups():
     )
 
 
-def test_remote_transport_metrics_count_each_retry_attempt() -> None:
+def test_remote_target_does_not_infer_retry_attempt_stages() -> None:
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
@@ -116,21 +116,22 @@ def test_remote_transport_metrics_count_each_retry_attempt() -> None:
 
     stats = target.get_stats()
     assert isinstance(stats, FakeTelemetryStats)
-    assert (
-        "counter",
-        "kvcr_transfer_blocks_failed",
-        1,
-        ("transport",),
-    ) in stats.records
-    assert (
-        "counter",
-        TRANSFER_BLOCKS_METRIC,
-        1,
-        ("remote_deliver",),
-    ) in stats.records
+    assert not any(
+        record[0] == "counter"
+        and record[1]
+        in {
+            "kvcr_source_blocks_available",
+            "kvcr_source_blocks_missing",
+            "kvcr_transfer_blocks_submitted",
+            "kvcr_transfer_blocks",
+            "kvcr_transfer_blocks_failed",
+            "kvcr_blocks_cancelled",
+        }
+        for record in stats.records
+    )
 
 
-def test_remote_cancelled_before_submit_is_transport_terminal() -> None:
+def test_remote_target_does_not_duplicate_source_cancellation() -> None:
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
@@ -156,12 +157,10 @@ def test_remote_cancelled_before_submit_is_transport_terminal() -> None:
     ]
     stats = target.get_stats()
     assert isinstance(stats, FakeTelemetryStats)
-    assert (
-        "counter",
-        "kvcr_blocks_cancelled",
-        1,
-        ("before_submit",),
-    ) in stats.records
+    assert not any(
+        record[0] == "counter" and record[1] == "kvcr_blocks_cancelled"
+        for record in stats.records
+    )
 
 
 def test_remote_control_send_failure_is_source_unreachable() -> None:
@@ -198,7 +197,7 @@ def test_remote_control_send_failure_is_source_unreachable() -> None:
     assert mismatches == [("worker_unreachable", 1)]
 
 
-def test_remote_source_validation_timeout_is_source_unavailable() -> None:
+def test_remote_target_does_not_duplicate_source_validation_timeout() -> None:
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl("tcp://target:1")
     mismatches: list[tuple[str, int]] = []
@@ -230,18 +229,17 @@ def test_remote_source_validation_timeout_is_source_unavailable() -> None:
     ]
     stats = target.get_stats()
     assert isinstance(stats, FakeTelemetryStats)
-    assert (
-        "counter",
-        "kvcr_source_blocks_missing",
-        1,
-        ("source_validation_timeout",),
-    ) in stats.records
     assert not any(
         record[0] == "counter"
-        and record[1] in {"kvcr_transfer_blocks_failed", "kvcr_blocks_cancelled"}
+        and record[1]
+        in {
+            "kvcr_source_blocks_missing",
+            "kvcr_transfer_blocks_failed",
+            "kvcr_blocks_cancelled",
+        }
         for record in stats.records
     )
-    assert mismatches == [("source_validation_timeout", 1)]
+    assert mismatches == []
 
 
 def test_remote_invalid_completed_layout_is_source_mismatch() -> None:
@@ -714,16 +712,14 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     assert not kvcr._core._block_record_map
     stats = kvcr.get_stats()
     assert isinstance(stats, FakeTelemetryStats)
-    expected_metric = (
-        TRANSFER_BLOCKS_METRIC if terminal_success else "kvcr_transfer_blocks_failed"
-    )
-    assert any(
-        record[0] == "counter" and record[1] == expected_metric
+    assert not any(
+        record[0] == "counter"
+        and record[1] in {TRANSFER_BLOCKS_METRIC, "kvcr_transfer_blocks_failed"}
         for record in stats.records
     )
 
 
-def test_kvcr_missing_terminal_expires_as_source_unreachable() -> None:
+def test_kvcr_missing_terminal_does_not_invent_attempt_stage() -> None:
     now = 0.0
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl()
@@ -755,14 +751,17 @@ def test_kvcr_missing_terminal_expires_as_source_unreachable() -> None:
     ]
     stats = kvcr.get_stats()
     assert isinstance(stats, FakeTelemetryStats)
-    assert (
-        "counter",
-        "kvcr_source_blocks_missing",
-        1,
-        ("worker_unreachable",),
-    ) in stats.records
     assert not any(
-        record[0] == "counter" and record[1] == "kvcr_transfer_blocks_failed"
+        record[0] == "counter"
+        and record[1]
+        in {
+            "kvcr_source_blocks_available",
+            "kvcr_source_blocks_missing",
+            "kvcr_transfer_blocks_submitted",
+            "kvcr_transfer_blocks",
+            "kvcr_transfer_blocks_failed",
+            "kvcr_blocks_cancelled",
+        }
         for record in stats.records
     )
 
@@ -913,6 +912,9 @@ def test_remote_framework_dram_transfers_available_prefix(
         source_control,
         KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
         name="source",
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
     )
     source._core._clock = lambda: 0.0
     keys = (BlockKey(b"k0"), BlockKey(b"k1"))
@@ -990,8 +992,8 @@ def test_remote_framework_dram_transfers_available_prefix(
         "counter",
         TRANSFER_BLOCKS_METRIC,
         completed_count,
-        ("remote_deliver",),
-    ) in target_stats.records
+        ("source_write",),
+    ) in source_stats.records
     assert (
         "counter",
         TRANSFER_BYTES_METRIC,
@@ -1032,8 +1034,15 @@ def test_remote_framework_dram_rejects_stale_source_inventory_epoch() -> None:
         source_agent,
         FakePrimaryPinning(),
         source_control,
-        KVCRConfig(nixl_agent_name="source", inventory_epoch=8),
+        KVCRConfig(
+            nixl_agent_name="source",
+            inventory_epoch=8,
+            enable_telemetry=True,
+        ),
         name="source",
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
     )
     key = BlockKey(b"k0")
     target.submit_hint(
@@ -1061,14 +1070,14 @@ def test_remote_framework_dram_rejects_stale_source_inventory_epoch() -> None:
     assert not entries[key].success
     assert source_agent.xfers == []
     assert mismatches == [("epoch_mismatch", 1)]
-    target_stats = target.get_stats()
-    assert isinstance(target_stats, FakeTelemetryStats)
+    source_stats = source.get_stats()
+    assert isinstance(source_stats, FakeTelemetryStats)
     assert (
         "counter",
         "kvcr_source_blocks_missing",
         1,
         ("epoch_mismatch",),
-    ) in target_stats.records
+    ) in source_stats.records
 
 
 @pytest.mark.parametrize(
@@ -1120,6 +1129,7 @@ def test_remote_transport_conservation_on_failure(
     if not reject_before_submit:
         source_agent.state = "ERR"
     _wait_until(lambda: bool(source_agent.sent_notifs))
+    assert _poll_until(source, lambda _: not _has_outstanding_operations(source)) == []
     target_agent.notifs["source"] = [source_agent.sent_notifs[-1][1]]
     assert _poll_until(target, lambda completed: bool(completed)) == [
         (op_handle, _op_entries({key: False}))
@@ -1149,7 +1159,7 @@ def test_remote_transport_conservation_on_failure(
         terminal_metric,
         1,
         terminal_labels,
-    ) in target_stats.records
+    ) in source_stats.records
     assert not any(
         record[0] == "counter"
         and record[1] == TRANSFER_BLOCKS_METRIC

@@ -179,13 +179,7 @@ class _TargetPullOp(_RemoteOp):
             logical_completed_keys, _ = backend._partition_logical_representatives(
                 self.ordered_keys, completed_keys
             )
-            if logical_completed_keys and not self.terminal_recorded:
-                backend._record_distinct_progress_counter(
-                    TRANSFER_BLOCKS_METRIC,
-                    logical_completed_keys,
-                    (scope,),
-                    self.request_id,
-                )
+            if logical_completed_keys:
                 # Descriptors are positionally aligned with ordered_keys, so
                 # count only the bytes for keys confirmed delivered.
                 backend._record_progress_counter(
@@ -199,47 +193,18 @@ class _TargetPullOp(_RemoteOp):
                     ),
                     (scope,),
                 )
-            mismatch_reason = (
-                "layout_mismatch"
-                if layout_mismatch
-                else event.get("inventory_mismatch_reason")
-            )
             _, logical_missing_keys = backend._partition_logical_representatives(
                 self.ordered_keys, completed_keys
             )
-            if mismatch_reason in {
-                "source_missing",
-                "source_validation_timeout",
-                "epoch_mismatch",
-                "worker_unreachable",
-                "layout_mismatch",
-            }:
-                if mismatch_reason != "source_missing":
-                    backend._record_inventory_mismatch(
-                        logical_missing_keys,
-                        str(mismatch_reason),
-                        self.request_id,
-                    )
-                else:
-                    sink = backend._kvcr._inventory_mismatch_sink_callback
-                    if sink is not None:
-                        sink("source_missing", len(logical_missing_keys))
-            elif logical_missing_keys and not self.terminal_recorded:
-                cancelled_stage = event.get("cancelled_stage")
-                if cancelled_stage in {"before_submit", "in_flight"}:
-                    backend._record_distinct_progress_counter(
-                        BLOCKS_CANCELLED_METRIC,
-                        logical_missing_keys,
-                        (str(cancelled_stage),),
-                        self.request_id,
-                    )
-                else:
-                    backend._record_distinct_progress_counter(
-                        TRANSFER_BLOCKS_FAILED_METRIC,
-                        logical_missing_keys,
-                        ("transport",),
-                        self.request_id,
-                    )
+            # The source owns V/X/S/D/F/C because it alone knows how far the
+            # attempt progressed.  The target consumes the terminal result but
+            # must not duplicate or infer attempt-stage metrics from it.
+            if layout_mismatch:
+                backend._record_inventory_mismatch(
+                    logical_missing_keys,
+                    "layout_mismatch",
+                    self.request_id,
+                )
             self.terminal_recorded = True
             result = (
                 "success"
@@ -255,8 +220,8 @@ class _TargetPullOp(_RemoteOp):
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 if self.terminal_deadline is None or now < self.terminal_deadline:
                     return False, False
-                backend._record_inventory_mismatch(
-                    self.ordered_keys, "worker_unreachable", self.request_id
+                backend._report_inventory_mismatch(
+                    self.ordered_keys, "worker_unreachable"
                 )
                 self.terminal_recorded = True
                 self.state = _TargetPullState.FINISHED
@@ -347,6 +312,16 @@ class _SourceWriteOp(_RemoteOp):
                         else "before_submit"
                     ),
                 )
+                if (
+                    self.state is not _SourceWriteState.NOTIFY_FAILURE
+                    and self.logical_metric_keys
+                ):
+                    backend._record_distinct_progress_counter(
+                        BLOCKS_CANCELLED_METRIC,
+                        self.logical_metric_keys,
+                        ("before_submit",),
+                        self.request_id,
+                    )
                 self.success = False
                 self.state = _SourceWriteState.FINISHED
                 backend._record_progress_duration(
@@ -416,6 +391,12 @@ class _SourceWriteOp(_RemoteOp):
                     False,
                     cancelled_stage="before_submit",
                 )
+                backend._record_distinct_progress_counter(
+                    BLOCKS_CANCELLED_METRIC,
+                    self.logical_metric_keys,
+                    ("before_submit",),
+                    self.request_id,
+                )
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
                 )
@@ -450,6 +431,22 @@ class _SourceWriteOp(_RemoteOp):
                 self.request_id,
             )
         else:
+            terminal_metric = (
+                BLOCKS_CANCELLED_METRIC
+                if self.cancelled_stage in {"before_submit", "in_flight"}
+                else TRANSFER_BLOCKS_FAILED_METRIC
+            )
+            terminal_labels = (
+                (str(self.cancelled_stage),)
+                if self.cancelled_stage in {"before_submit", "in_flight"}
+                else ("transport",)
+            )
+            backend._record_distinct_progress_counter(
+                terminal_metric,
+                self.logical_metric_keys,
+                terminal_labels,
+                self.request_id,
+            )
             backend._send_write_done(
                 progress,
                 self.remote_agent,
@@ -473,6 +470,12 @@ class _SourceWriteOp(_RemoteOp):
                 self.op_handle,
                 False,
                 cancelled_stage="in_flight",
+            )
+            self._backend._record_distinct_progress_counter(
+                BLOCKS_CANCELLED_METRIC,
+                self.logical_metric_keys,
+                ("in_flight",),
+                self.request_id,
             )
             self.transfer_id = None
         return True
@@ -1010,11 +1013,21 @@ class _RemoteFWDram:
                 raise TypeError("invalid source_inventory_epoch")
         except (KeyError, TypeError, ValueError, msgspec.ValidationError):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
-            self._notify_start_write_failure(progress, payload, op_handle)
+            self._notify_start_write_failure(
+                progress,
+                payload,
+                op_handle,
+                inventory_mismatch_reason="layout_mismatch",
+            )
             return
         if not keys or len(keys) != len(dst_descriptors):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
-            self._notify_start_write_failure(progress, payload, op_handle)
+            self._notify_start_write_failure(
+                progress,
+                payload,
+                op_handle,
+                inventory_mismatch_reason="layout_mismatch",
+            )
             return
 
         if (
@@ -1045,7 +1058,12 @@ class _RemoteFWDram:
             logger.warning(
                 "KVCR start_write setup failed for op=%d", op_handle, exc_info=True
             )
-            self._notify_start_write_failure(progress, payload, op_handle)
+            self._notify_start_write_failure(
+                progress,
+                payload,
+                op_handle,
+                inventory_mismatch_reason="worker_unreachable",
+            )
             return
 
         op_id = ("source", self._next_source_op_id)
@@ -1094,10 +1112,6 @@ class _RemoteFWDram:
                 source_pin.ordered_keys, completed_keys
             )
         )
-        if force_failure:
-            # A pin deadline is a cancellation before transport submission, not
-            # evidence that the routed source inventory was stale.
-            logical_missing_keys = ()
         if logical_available_keys:
             self._record_distinct_counter(
                 SOURCE_BLOCKS_AVAILABLE_METRIC,
@@ -1106,10 +1120,9 @@ class _RemoteFWDram:
                 source_pin.request_id,
             )
         if logical_missing_keys:
-            self._record_distinct_counter(
-                SOURCE_BLOCKS_MISSING_METRIC,
+            self._record_inventory_mismatch_main(
                 logical_missing_keys,
-                ("source_missing",),
+                "source_validation_timeout" if force_failure else "source_missing",
                 source_pin.request_id,
             )
 
@@ -1170,6 +1183,20 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         inventory_mismatch_reason: str | None = None,
     ) -> None:
+        if inventory_mismatch_reason is not None:
+            try:
+                keys = _message_keys(payload)
+            except (KeyError, TypeError, ValueError):
+                keys = ()
+            request_id = payload.get("request_id")
+            if not isinstance(request_id, str) or not request_id:
+                request_id = None
+            if keys:
+                self._record_inventory_mismatch(
+                    keys,
+                    inventory_mismatch_reason,
+                    request_id,
+                )
         try:
             _, remote_agent = self._remote_agent(progress, payload)
         except Exception:
@@ -1755,6 +1782,32 @@ class _RemoteFWDram:
             (reason,),
             request_id,
         )
+        sink = self._kvcr._inventory_mismatch_sink_callback
+        if sink is not None:
+            sink(reason, len({self._logical_identity(key) for key in keys}))
+
+    def _record_inventory_mismatch_main(
+        self,
+        keys: Collection[BlockKey],
+        reason: str,
+        request_id: str | None,
+    ) -> None:
+        self._record_distinct_counter(
+            SOURCE_BLOCKS_MISSING_METRIC,
+            keys,
+            (reason,),
+            request_id,
+        )
+        sink = self._kvcr._inventory_mismatch_sink_callback
+        if sink is not None:
+            sink(reason, len({self._logical_identity(key) for key in keys}))
+
+    def _report_inventory_mismatch(
+        self,
+        keys: Collection[BlockKey],
+        reason: str,
+    ) -> None:
+        """Report target liveness without inventing a source attempt stage."""
         sink = self._kvcr._inventory_mismatch_sink_callback
         if sink is not None:
             sink(reason, len({self._logical_identity(key) for key in keys}))
