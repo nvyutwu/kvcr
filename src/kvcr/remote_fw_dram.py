@@ -105,6 +105,7 @@ class _TargetPullOp(_RemoteOp):
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
     terminal_recorded: bool = False
+    terminal_deadline: float | None = None
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -208,6 +209,7 @@ class _TargetPullOp(_RemoteOp):
             )
             if mismatch_reason in {
                 "source_missing",
+                "source_validation_timeout",
                 "epoch_mismatch",
                 "worker_unreachable",
                 "layout_mismatch",
@@ -251,18 +253,21 @@ class _TargetPullOp(_RemoteOp):
 
         if now >= self.deadline:
             if self.state is _TargetPullState.WAITING_TERMINAL:
-                return False, False
-            _, logical_keys = backend._partition_logical_representatives(
-                self.ordered_keys, ()
-            )
-            backend._record_distinct_progress_counter(
-                TRANSFER_BLOCKS_FAILED_METRIC,
-                logical_keys,
-                ("transport",),
-                self.request_id,
-            )
-            self.terminal_recorded = True
+                if self.terminal_deadline is None or now < self.terminal_deadline:
+                    return False, False
+                backend._record_inventory_mismatch(
+                    self.ordered_keys, "worker_unreachable", self.request_id
+                )
+                self.terminal_recorded = True
+                self.state = _TargetPullState.FINISHED
+                backend._record_progress_duration(scope, self.started_at, "failed")
+                return True, True
             self.state = _TargetPullState.WAITING_TERMINAL
+            terminal_grace = min(
+                1.0,
+                max(0.05, backend._kvcr.config.operation_timeout_ms / 1000),
+            )
+            self.terminal_deadline = now + terminal_grace
             if self.local_fill:
                 backend._progress_outbound.append(
                     replace(
@@ -1123,6 +1128,13 @@ class _RemoteFWDram:
         source_pin.framework_pins.clear()
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
+        inventory_mismatch_reason = (
+            "source_validation_timeout"
+            if force_failure
+            else "source_missing"
+            if not completed_keys
+            else None
+        )
 
         source_write = _SourceWriteOp(
             state=(
@@ -1144,10 +1156,7 @@ class _RemoteFWDram:
             completed_count=len(completed_keys),
             request_id=source_pin.request_id,
             logical_metric_keys=logical_available_keys,
-            cancelled_stage="before_submit" if force_failure else None,
-            inventory_mismatch_reason=(
-                "source_missing" if not completed_keys and not force_failure else None
-            ),
+            inventory_mismatch_reason=inventory_mismatch_reason,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1688,6 +1697,17 @@ class _RemoteFWDram:
         request_id: str | None,
     ) -> int:
         identities = {self._logical_identity(key) for key in keys}
+        if name in {
+            TRANSFER_BLOCKS_METRIC,
+            TRANSFER_BLOCKS_FAILED_METRIC,
+            TRANSFER_BLOCKS_SUBMITTED_METRIC,
+            SOURCE_BLOCKS_AVAILABLE_METRIC,
+            SOURCE_BLOCKS_MISSING_METRIC,
+            BLOCKS_CANCELLED_METRIC,
+        }:
+            # These are attempt-scoped transport/source observations. Retrying
+            # the same logical block is a new attempt and must remain visible.
+            return len(identities)
         if request_id is None:
             return len(identities)
         request_state = self._metric_seen.setdefault(request_id, {})
@@ -1695,20 +1715,6 @@ class _RemoteFWDram:
         while len(self._metric_seen) > 4096:
             self._metric_seen.popitem(last=False)
         dedup_key = (name, labels)
-        if (
-            (
-                name == TRANSFER_BLOCKS_METRIC
-                and labels in {("remote_deliver",), ("remote_fetch",)}
-            )
-            or name == TRANSFER_BLOCKS_FAILED_METRIC
-            or (
-                name == BLOCKS_CANCELLED_METRIC
-                and labels in {("before_submit",), ("in_flight",)}
-            )
-        ):
-            dedup_key = ("transport_terminal", ())
-        elif name in {SOURCE_BLOCKS_AVAILABLE_METRIC, SOURCE_BLOCKS_MISSING_METRIC}:
-            dedup_key = ("source_resolution", ())
         seen = request_state.setdefault(dedup_key, set())
         new_identities = identities - seen
         seen.update(new_identities)

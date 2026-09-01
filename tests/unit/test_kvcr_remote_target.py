@@ -28,7 +28,11 @@ from _kvcr_test_utils import (
     _write_done_notification,
 )
 
-from kvcr import TRANSFER_BLOCKS_METRIC, TRANSFER_BYTES_METRIC
+from kvcr import (
+    SOURCE_BLOCKS_AVAILABLE_METRIC,
+    TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BYTES_METRIC,
+)
 from kvcr.config import KVCRConfig, LocalDramInfo, RemoteFWDramOptions
 from kvcr.types import (
     BlockKey,
@@ -50,7 +54,7 @@ class _LogicalHashHintAdapter(_MatchingHintAdapter):
         return bytes(key[:-4])
 
 
-def test_remote_metrics_deduplicate_logical_blocks_across_groups_and_retries():
+def test_remote_request_stage_deduplicates_logical_physical_groups():
     target = _new_kvcr(
         FakeNixlAgent(),
         FakePrimaryPinning(),
@@ -64,9 +68,21 @@ def test_remote_metrics_deduplicate_logical_blocks_across_groups_and_retries():
     assert backend._new_metric_identity_count("stage", keys, (), "req") == 1
     assert backend._new_metric_identity_count("stage", keys, (), "req") == 0
     assert backend._new_metric_identity_count("next", keys, (), "req") == 1
+    assert (
+        backend._new_metric_identity_count(
+            SOURCE_BLOCKS_AVAILABLE_METRIC, keys, (), "req"
+        )
+        == 1
+    )
+    assert (
+        backend._new_metric_identity_count(
+            SOURCE_BLOCKS_AVAILABLE_METRIC, keys, (), "req"
+        )
+        == 1
+    )
 
 
-def test_remote_transport_terminal_is_exclusive_across_retry() -> None:
+def test_remote_transport_metrics_count_each_retry_attempt() -> None:
     agent = FakeNixlAgent(metadata=b"target-md")
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
@@ -106,12 +122,12 @@ def test_remote_transport_terminal_is_exclusive_across_retry() -> None:
         1,
         ("transport",),
     ) in stats.records
-    assert not any(
-        record[0] == "counter"
-        and record[1] == TRANSFER_BLOCKS_METRIC
-        and record[3] == ("remote_deliver",)
-        for record in stats.records
-    )
+    assert (
+        "counter",
+        TRANSFER_BLOCKS_METRIC,
+        1,
+        ("remote_deliver",),
+    ) in stats.records
 
 
 def test_remote_cancelled_before_submit_is_transport_terminal() -> None:
@@ -180,6 +196,52 @@ def test_remote_control_send_failure_is_source_unreachable() -> None:
         ("worker_unreachable",),
     ) in stats.records
     assert mismatches == [("worker_unreachable", 1)]
+
+
+def test_remote_source_validation_timeout_is_source_unavailable() -> None:
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    mismatches: list[tuple[str, int]] = []
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_MatchingHintAdapter(),
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    key = BlockKey(b"pin-timeout")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    op_handle = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [
+        _write_done_notification(
+            op_handle,
+            success=False,
+            inventory_mismatch_reason="source_validation_timeout",
+        )
+    ]
+
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (op_handle, _op_entries({key: False}))
+    ]
+    stats = target.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_source_blocks_missing",
+        1,
+        ("source_validation_timeout",),
+    ) in stats.records
+    assert not any(
+        record[0] == "counter"
+        and record[1] in {"kvcr_transfer_blocks_failed", "kvcr_blocks_cancelled"}
+        for record in stats.records
+    )
+    assert mismatches == [("source_validation_timeout", 1)]
 
 
 def test_remote_invalid_completed_layout_is_source_mismatch() -> None:
@@ -607,7 +669,11 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
         agent,
         FakePrimaryPinning(),
         control,
-        KVCRConfig(nixl_agent_name="target", operation_timeout_ms=1000),
+        KVCRConfig(
+            nixl_agent_name="target",
+            operation_timeout_ms=1000,
+            enable_telemetry=True,
+        ),
     )
     kvcr._core._clock = lambda: now
     key = BlockKey(b"k0")
@@ -630,6 +696,13 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     )
     assert list(kvcr.poll_completed()) == []
     assert _has_outstanding_operations(kvcr)
+    stats = kvcr.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert not any(
+        record[0] == "counter"
+        and record[1] in {"kvcr_transfer_blocks_failed", TRANSFER_BLOCKS_METRIC}
+        for record in stats.records
+    )
 
     agent.notifs["source"] = [
         _write_done_notification(op_handle, success=terminal_success)
@@ -639,6 +712,59 @@ def test_kvcr_deliver_timeout_waits_for_terminal_notification(
     ]
     assert not kvcr._core._remote_fw_dram._source_pin_ops
     assert not kvcr._core._block_record_map
+    stats = kvcr.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    expected_metric = (
+        TRANSFER_BLOCKS_METRIC if terminal_success else "kvcr_transfer_blocks_failed"
+    )
+    assert any(
+        record[0] == "counter" and record[1] == expected_metric
+        for record in stats.records
+    )
+
+
+def test_kvcr_missing_terminal_expires_as_source_unreachable() -> None:
+    now = 0.0
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl()
+    kvcr = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(
+            nixl_agent_name="target",
+            operation_timeout_ms=1000,
+            enable_telemetry=True,
+        ),
+    )
+    kvcr._core._clock = lambda: now
+    key = BlockKey(b"no-terminal")
+    kvcr.submit_hint([key], src="tcp://source:1", request_id="req")
+    op_handle = kvcr.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(control.sent))
+
+    now = 2.0
+    _wait_until(
+        lambda: "tcp://source:1" not in kvcr._core._remote_fw_dram._metadata_retry_after
+    )
+    assert list(kvcr.poll_completed()) == []
+
+    now = 4.0
+    assert _poll_until(kvcr, lambda completed: bool(completed)) == [
+        (op_handle, _op_entries({key: False}))
+    ]
+    stats = kvcr.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_source_blocks_missing",
+        1,
+        ("worker_unreachable",),
+    ) in stats.records
+    assert not any(
+        record[0] == "counter" and record[1] == "kvcr_transfer_blocks_failed"
+        for record in stats.records
+    )
 
 
 def test_kvcr_target_ignores_unknown_op_handle_notification():

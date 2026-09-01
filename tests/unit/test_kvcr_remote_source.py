@@ -75,7 +75,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         "type": "write_done",
         "op_handle": 9,
         "success": False,
-        "cancelled_stage": "before_submit",
+        "inventory_mismatch_reason": "source_validation_timeout",
     }
 
 

@@ -351,6 +351,7 @@ def _write_done_notification(
     success: bool = True,
     completed_count: int | None = None,
     cancelled_stage: str | None = None,
+    inventory_mismatch_reason: str | None = None,
 ) -> bytes:
     payload = {
         "type": "write_done",
@@ -361,6 +362,8 @@ def _write_done_notification(
         payload["completed_count"] = completed_count
     if cancelled_stage is not None:
         payload["cancelled_stage"] = cancelled_stage
+    if inventory_mismatch_reason is not None:
+        payload["inventory_mismatch_reason"] = inventory_mismatch_reason
     return b"KVCR:" + msgspec.msgpack.encode(payload)
 
 
