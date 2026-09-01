@@ -1774,15 +1774,19 @@ class _RemoteFWDram:
         reason: str,
         request_id: str | None,
     ) -> None:
+        """Source-attributable mismatch: the source ledger is the only sink.
+
+        The mismatch sink is deliberately NOT called here. These reasons already
+        reach Prometheus as `kvcr_source_blocks_missing{reason}`; forwarding them
+        as well would make the target family a superset of the source family
+        instead of a partition of it.
+        """
         self._record_distinct_progress_counter(
             SOURCE_BLOCKS_MISSING_METRIC,
             keys,
             (reason,),
             request_id,
         )
-        sink = self._kvcr._inventory_mismatch_sink_callback
-        if sink is not None:
-            sink(reason, len({self._logical_identity(key) for key in keys}))
 
     def _record_inventory_mismatch_main(
         self,
@@ -1790,22 +1794,24 @@ class _RemoteFWDram:
         reason: str,
         request_id: str | None,
     ) -> None:
+        """As `_record_inventory_mismatch`, on the main progress path."""
         self._record_distinct_counter(
             SOURCE_BLOCKS_MISSING_METRIC,
             keys,
             (reason,),
             request_id,
         )
-        sink = self._kvcr._inventory_mismatch_sink_callback
-        if sink is not None:
-            sink(reason, len({self._logical_identity(key) for key in keys}))
 
     def _report_inventory_mismatch(
         self,
         keys: Collection[BlockKey],
         reason: str,
     ) -> None:
-        """Report target liveness without inventing a source attempt stage."""
+        """Report target liveness without inventing a source attempt stage.
+
+        The mismatch sink exists for exactly this path: reasons observed by the
+        target that no source attempt can account for.
+        """
         sink = self._kvcr._inventory_mismatch_sink_callback
         if sink is not None:
             sink(reason, len({self._logical_identity(key) for key in keys}))
