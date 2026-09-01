@@ -100,8 +100,6 @@ class KeyHintAdapter(Protocol):
 
     def matches(self, key: BlockKey, hint: object) -> bool: ...
 
-    def logical_key(self, key: BlockKey) -> object: ...
-
 
 @dataclass(frozen=True)
 class KVCRConfig:

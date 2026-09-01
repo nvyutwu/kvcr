@@ -350,6 +350,7 @@ def _write_done_notification(
     *,
     success: bool = True,
     completed_count: int | None = None,
+    cancelled_stage: str | None = None,
 ) -> bytes:
     payload = {
         "type": "write_done",
@@ -358,6 +359,8 @@ def _write_done_notification(
     }
     if completed_count is not None:
         payload["completed_count"] = completed_count
+    if cancelled_stage is not None:
+        payload["cancelled_stage"] = cancelled_stage
     return b"KVCR:" + msgspec.msgpack.encode(payload)
 
 

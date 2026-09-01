@@ -104,6 +104,7 @@ class _TargetPullOp(_RemoteOp):
     source_inventory_epoch: int | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
+    terminal_recorded: bool = False
 
     def progress(
         self, progress: _KVCRProgress, event: object | None
@@ -113,6 +114,9 @@ class _TargetPullOp(_RemoteOp):
         scope = "remote_fetch" if self.local_fill else "remote_deliver"
         if self.state is _TargetPullState.START_WRITE:
             if now >= self.deadline:
+                backend._record_inventory_mismatch(
+                    self.ordered_keys, "worker_unreachable", self.request_id
+                )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -131,6 +135,9 @@ class _TargetPullOp(_RemoteOp):
                 },
             )
             if not sent:
+                backend._record_inventory_mismatch(
+                    self.ordered_keys, "worker_unreachable", self.request_id
+                )
                 self.success = False
                 self.state = _TargetPullState.FINISHED
                 backend._record_progress_duration(scope, self.started_at, "failed")
@@ -149,6 +156,7 @@ class _TargetPullOp(_RemoteOp):
                     and now < self.deadline
                 )
             )
+            layout_mismatch = False
             try:
                 if success and "completed_count" in event:
                     completed_count = _notification_completed_count(
@@ -162,6 +170,7 @@ class _TargetPullOp(_RemoteOp):
             except TypeError:
                 success = False
                 completed_keys = set()
+                layout_mismatch = True
             all_completed = success and completed_keys == self.keys
             self.success = success
             self.completed_keys = completed_keys
@@ -169,7 +178,7 @@ class _TargetPullOp(_RemoteOp):
             logical_completed_keys, _ = backend._partition_logical_representatives(
                 self.ordered_keys, completed_keys
             )
-            if logical_completed_keys:
+            if logical_completed_keys and not self.terminal_recorded:
                 backend._record_distinct_progress_counter(
                     TRANSFER_BLOCKS_METRIC,
                     logical_completed_keys,
@@ -189,20 +198,47 @@ class _TargetPullOp(_RemoteOp):
                     ),
                     (scope,),
                 )
-            mismatch_reason = event.get("inventory_mismatch_reason")
+            mismatch_reason = (
+                "layout_mismatch"
+                if layout_mismatch
+                else event.get("inventory_mismatch_reason")
+            )
+            _, logical_missing_keys = backend._partition_logical_representatives(
+                self.ordered_keys, completed_keys
+            )
             if mismatch_reason in {
                 "source_missing",
                 "epoch_mismatch",
                 "worker_unreachable",
                 "layout_mismatch",
             }:
-                sink = backend._kvcr._inventory_mismatch_sink_callback
-                if sink is not None:
-                    missing_keys = self.keys - completed_keys
-                    sink(
+                if mismatch_reason != "source_missing":
+                    backend._record_inventory_mismatch(
+                        logical_missing_keys,
                         str(mismatch_reason),
-                        len({backend._logical_identity(key) for key in missing_keys}),
+                        self.request_id,
                     )
+                else:
+                    sink = backend._kvcr._inventory_mismatch_sink_callback
+                    if sink is not None:
+                        sink("source_missing", len(logical_missing_keys))
+            elif logical_missing_keys and not self.terminal_recorded:
+                cancelled_stage = event.get("cancelled_stage")
+                if cancelled_stage in {"before_submit", "in_flight"}:
+                    backend._record_distinct_progress_counter(
+                        BLOCKS_CANCELLED_METRIC,
+                        logical_missing_keys,
+                        (str(cancelled_stage),),
+                        self.request_id,
+                    )
+                else:
+                    backend._record_distinct_progress_counter(
+                        TRANSFER_BLOCKS_FAILED_METRIC,
+                        logical_missing_keys,
+                        ("transport",),
+                        self.request_id,
+                    )
+            self.terminal_recorded = True
             result = (
                 "success"
                 if all_completed
@@ -216,6 +252,16 @@ class _TargetPullOp(_RemoteOp):
         if now >= self.deadline:
             if self.state is _TargetPullState.WAITING_TERMINAL:
                 return False, False
+            _, logical_keys = backend._partition_logical_representatives(
+                self.ordered_keys, ()
+            )
+            backend._record_distinct_progress_counter(
+                TRANSFER_BLOCKS_FAILED_METRIC,
+                logical_keys,
+                ("transport",),
+                self.request_id,
+            )
+            self.terminal_recorded = True
             self.state = _TargetPullState.WAITING_TERMINAL
             if self.local_fill:
                 backend._progress_outbound.append(
@@ -271,6 +317,8 @@ class _SourceWriteOp(_RemoteOp):
     request_id: str | None = None
     was_submitted: bool = False
     logical_metric_keys: tuple[BlockKey, ...] = ()
+    cancelled_stage: str | None = None
+    inventory_mismatch_reason: str | None = None
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -282,18 +330,17 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
-                if (
-                    self.state is not _SourceWriteState.NOTIFY_FAILURE
-                    and self.completed_count
-                ):
-                    backend._record_distinct_progress_counter(
-                        BLOCKS_CANCELLED_METRIC,
-                        self.logical_metric_keys,
-                        ("before_submit",),
-                        self.request_id,
-                    )
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, False
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    False,
+                    inventory_mismatch_reason=self.inventory_mismatch_reason,
+                    cancelled_stage=(
+                        self.cancelled_stage
+                        if self.state is _SourceWriteState.NOTIFY_FAILURE
+                        else "before_submit"
+                    ),
                 )
                 self.success = False
                 self.state = _SourceWriteState.FINISHED
@@ -337,12 +384,7 @@ class _SourceWriteOp(_RemoteOp):
                         "KVCR start_write submission failed for op=%d",
                         self.op_handle,
                     )
-                    backend._record_distinct_progress_counter(
-                        BLOCKS_CANCELLED_METRIC,
-                        self.logical_metric_keys,
-                        ("before_submit",),
-                        self.request_id,
-                    )
+                    self.cancelled_stage = "before_submit"
                 else:
                     self.was_submitted = True
                     backend._record_distinct_progress_counter(
@@ -362,14 +404,12 @@ class _SourceWriteOp(_RemoteOp):
                     "transfer_submit", submit_started_at, "failed"
                 )
                 self.success = False
-                backend._record_distinct_progress_counter(
-                    BLOCKS_CANCELLED_METRIC,
-                    self.logical_metric_keys,
-                    ("before_submit",),
-                    self.request_id,
-                )
                 backend._send_write_done(
-                    progress, self.remote_agent, self.op_handle, False
+                    progress,
+                    self.remote_agent,
+                    self.op_handle,
+                    False,
+                    cancelled_stage="before_submit",
                 )
                 backend._record_progress_duration(
                     "source_write", self.started_at, "failed"
@@ -385,6 +425,7 @@ class _SourceWriteOp(_RemoteOp):
             and backend._kvcr._clock() >= self.deadline
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
+            self.cancelled_stage = "in_flight"
             observed_work = True
         cancellation_requested = self.state is _SourceWriteState.CANCEL_PENDING
         transfer_result = progress.poll_transfer(
@@ -404,20 +445,13 @@ class _SourceWriteOp(_RemoteOp):
                 self.request_id,
             )
         else:
-            if self.was_submitted:
-                metric = (
-                    BLOCKS_CANCELLED_METRIC
-                    if cancellation_requested
-                    else TRANSFER_BLOCKS_FAILED_METRIC
-                )
-                labels = ("in_flight",) if cancellation_requested else ("transport",)
-                backend._record_distinct_progress_counter(
-                    metric,
-                    self.logical_metric_keys,
-                    labels,
-                    self.request_id,
-                )
-            backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
+            backend._send_write_done(
+                progress,
+                self.remote_agent,
+                self.op_handle,
+                False,
+                cancelled_stage=self.cancelled_stage,
+            )
         result = "success" if success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
         self.success = success
@@ -428,11 +462,12 @@ class _SourceWriteOp(_RemoteOp):
         if self.transfer_id is not None:
             if not progress.cancel_transfer(self.transfer_id):
                 return False
-            self._backend._record_distinct_progress_counter(
-                BLOCKS_CANCELLED_METRIC,
-                self.logical_metric_keys,
-                ("in_flight",),
-                self.request_id,
+            self._backend._send_write_done(
+                progress,
+                self.remote_agent,
+                self.op_handle,
+                False,
+                cancelled_stage="in_flight",
             )
             self.transfer_id = None
         return True
@@ -1054,6 +1089,10 @@ class _RemoteFWDram:
                 source_pin.ordered_keys, completed_keys
             )
         )
+        if force_failure:
+            # A pin deadline is a cancellation before transport submission, not
+            # evidence that the routed source inventory was stale.
+            logical_missing_keys = ()
         if logical_available_keys:
             self._record_distinct_counter(
                 SOURCE_BLOCKS_AVAILABLE_METRIC,
@@ -1105,6 +1144,10 @@ class _RemoteFWDram:
             completed_count=len(completed_keys),
             request_id=source_pin.request_id,
             logical_metric_keys=logical_available_keys,
+            cancelled_stage="before_submit" if force_failure else None,
+            inventory_mismatch_reason=(
+                "source_missing" if not completed_keys and not force_failure else None
+            ),
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1651,7 +1694,22 @@ class _RemoteFWDram:
         self._metric_seen.move_to_end(request_id)
         while len(self._metric_seen) > 4096:
             self._metric_seen.popitem(last=False)
-        seen = request_state.setdefault((name, labels), set())
+        dedup_key = (name, labels)
+        if (
+            (
+                name == TRANSFER_BLOCKS_METRIC
+                and labels in {("remote_deliver",), ("remote_fetch",)}
+            )
+            or name == TRANSFER_BLOCKS_FAILED_METRIC
+            or (
+                name == BLOCKS_CANCELLED_METRIC
+                and labels in {("before_submit",), ("in_flight",)}
+            )
+        ):
+            dedup_key = ("transport_terminal", ())
+        elif name in {SOURCE_BLOCKS_AVAILABLE_METRIC, SOURCE_BLOCKS_MISSING_METRIC}:
+            dedup_key = ("source_resolution", ())
+        seen = request_state.setdefault(dedup_key, set())
         new_identities = identities - seen
         seen.update(new_identities)
         return len(new_identities)
@@ -1679,6 +1737,22 @@ class _RemoteFWDram:
         if count:
             self._record_progress_counter(name, count, labels)
 
+    def _record_inventory_mismatch(
+        self,
+        keys: Collection[BlockKey],
+        reason: str,
+        request_id: str | None,
+    ) -> None:
+        self._record_distinct_progress_counter(
+            SOURCE_BLOCKS_MISSING_METRIC,
+            keys,
+            (reason,),
+            request_id,
+        )
+        sink = self._kvcr._inventory_mismatch_sink_callback
+        if sink is not None:
+            sink(reason, len({self._logical_identity(key) for key in keys}))
+
     def _apply_progress_update(self, update: _ProgressUpdate) -> None:
         self._connected_remote_count = update.connected_remote_count
         stats = self._kvcr._stats
@@ -1697,6 +1771,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         success: bool,
         inventory_mismatch_reason: str | None = None,
+        cancelled_stage: str | None = None,
     ) -> None:
         agent = progress.nixl_agent
         send_notif = getattr(agent, "send_notif", None)
@@ -1713,6 +1788,7 @@ class _RemoteFWDram:
                     op_handle,
                     success,
                     inventory_mismatch_reason=inventory_mismatch_reason,
+                    cancelled_stage=cancelled_stage,
                 ),
             )
         except Exception:
@@ -1747,6 +1823,7 @@ def _write_done_notif(
     success: bool,
     completed_count: int | None = None,
     inventory_mismatch_reason: str | None = None,
+    cancelled_stage: str | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": "write_done",
@@ -1757,6 +1834,8 @@ def _write_done_notif(
         payload["completed_count"] = completed_count
     if inventory_mismatch_reason is not None:
         payload["inventory_mismatch_reason"] = inventory_mismatch_reason
+    if cancelled_stage is not None:
+        payload["cancelled_stage"] = cancelled_stage
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)
 
 

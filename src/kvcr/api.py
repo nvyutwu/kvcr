@@ -67,12 +67,12 @@ class KVCRBindings:
     framework_control: FrameworkControl | None = None
     key_hint_adapter: KeyHintAdapter | None = None
     inventory_sink: InventorySink | None = None
-    inventory_mismatch_sink: InventoryMismatchSink | None = None
 
     # Capacity pressure, telemetry, and placement policy.
     capacity_needed_callback: Callable[[int], None] | None = None
     stats_factory: Callable[[], TelemetryStats] | None = None
     policy: "KVCachePolicy | None" = None
+    inventory_mismatch_sink: InventoryMismatchSink | None = None
 
 
 class KVCR:

@@ -75,6 +75,7 @@ def test_kvcr_start_write_respects_framework_pin_deadline(
         "type": "write_done",
         "op_handle": 9,
         "success": False,
+        "cancelled_stage": "before_submit",
     }
 
 
@@ -201,6 +202,7 @@ def test_kvcr_source_transfer_error_notifies_failure_and_cleans_up(
         "type": "write_done",
         "op_handle": 5,
         "success": False,
+        "cancelled_stage": "before_submit",
     }
     assert source_agent.released_xfers == ([] if failure == "initialize" else [1])
     assert not _has_outstanding_operations(kvcr)
@@ -319,6 +321,7 @@ def test_kvcr_source_timeout_holds_pins_until_safe_release(
             "type": "write_done",
             "op_handle": 12,
             "success": False,
+            "cancelled_stage": "in_flight",
         }
     else:
         assert source_agent.sent_notifs == []

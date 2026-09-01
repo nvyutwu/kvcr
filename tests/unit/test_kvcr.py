@@ -42,6 +42,15 @@ _GUARD_CONFIG = KVCRGuardConfig(
 )
 
 
+def test_inventory_mismatch_binding_preserves_existing_positional_order() -> None:
+    existing_bindings = [object() for _ in range(10)]
+
+    bindings = KVCRBindings(*existing_bindings)  # type: ignore[arg-type]
+
+    assert bindings.policy is existing_bindings[-1]
+    assert bindings.inventory_mismatch_sink is None
+
+
 def test_service_dram_is_resolved_and_released_after_core(monkeypatch) -> None:
     events: list[str] = []
     hold = SimpleNamespace(

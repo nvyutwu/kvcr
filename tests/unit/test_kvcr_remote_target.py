@@ -66,6 +66,157 @@ def test_remote_metrics_deduplicate_logical_blocks_across_groups_and_retries():
     assert backend._new_metric_identity_count("next", keys, (), "req") == 1
 
 
+def test_remote_transport_terminal_is_exclusive_across_retry() -> None:
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_MatchingHintAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    key = BlockKey(b"retry")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+
+    failed_op = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [_write_done_notification(failed_op, success=False)]
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (failed_op, _op_entries({key: False}))
+    ]
+
+    control.sent = []
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    successful_op = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [
+        _write_done_notification(successful_op, completed_count=1)
+    ]
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (successful_op, _op_entries({key: True}))
+    ]
+
+    stats = target.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_transfer_blocks_failed",
+        1,
+        ("transport",),
+    ) in stats.records
+    assert not any(
+        record[0] == "counter"
+        and record[1] == TRANSFER_BLOCKS_METRIC
+        and record[3] == ("remote_deliver",)
+        for record in stats.records
+    )
+
+
+def test_remote_cancelled_before_submit_is_transport_terminal() -> None:
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_MatchingHintAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    key = BlockKey(b"cancel")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    op_handle = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [
+        _write_done_notification(
+            op_handle, success=False, cancelled_stage="before_submit"
+        )
+    ]
+
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (op_handle, _op_entries({key: False}))
+    ]
+    stats = target.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_blocks_cancelled",
+        1,
+        ("before_submit",),
+    ) in stats.records
+
+
+def test_remote_control_send_failure_is_source_unreachable() -> None:
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    control.send_result = False
+    mismatches: list[tuple[str, int]] = []
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_MatchingHintAdapter(),
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    key = BlockKey(b"unreachable")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    op_handle = target.deliver({key: _mem_descriptor()}, request_id="req")
+
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (op_handle, _op_entries({key: False}))
+    ]
+    stats = target.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_source_blocks_missing",
+        1,
+        ("worker_unreachable",),
+    ) in stats.records
+    assert mismatches == [("worker_unreachable", 1)]
+
+
+def test_remote_invalid_completed_layout_is_source_mismatch() -> None:
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    mismatches: list[tuple[str, int]] = []
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_MatchingHintAdapter(),
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    key = BlockKey(b"layout")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    op_handle = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(control.sent))
+    agent.notifs["source"] = [_write_done_notification(op_handle, completed_count=2)]
+
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (op_handle, _op_entries({key: False}))
+    ]
+    stats = target.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_source_blocks_missing",
+        1,
+        ("layout_mismatch",),
+    ) in stats.records
+    assert mismatches == [("layout_mismatch", 1)]
+
+
 def test_remote_metrics_require_all_physical_groups_for_logical_delivery():
     target = _new_kvcr(
         FakeNixlAgent(),
@@ -373,6 +524,7 @@ def test_kvcr_deliver_propagates_source_pin_miss():
         "type": "write_done",
         "op_handle": op_handle,
         "success": False,
+        "inventory_mismatch_reason": "source_missing",
     }
 
     target_agent.notifs["source"] = [source_agent.sent_notifs[0][1]]
@@ -739,6 +891,11 @@ def test_remote_framework_dram_rejects_stale_source_inventory_epoch() -> None:
         target_agent,
         FakePrimaryPinning(),
         target_control,
+        KVCRConfig(
+            nixl_agent_name="target",
+            enable_telemetry=True,
+            inventory_report_interval_ms=0,
+        ),
         key_hint_adapter=_MatchingHintAdapter(),
         inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
             (reason, blocks)
@@ -778,3 +935,98 @@ def test_remote_framework_dram_rejects_stale_source_inventory_epoch() -> None:
     assert not entries[key].success
     assert source_agent.xfers == []
     assert mismatches == [("epoch_mismatch", 1)]
+    target_stats = target.get_stats()
+    assert isinstance(target_stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_source_blocks_missing",
+        1,
+        ("epoch_mismatch",),
+    ) in target_stats.records
+
+
+@pytest.mark.parametrize(
+    ("reject_before_submit", "terminal_metric", "terminal_labels", "submitted"),
+    [
+        (False, "kvcr_transfer_blocks_failed", ("transport",), True),
+        (True, "kvcr_blocks_cancelled", ("before_submit",), False),
+    ],
+)
+def test_remote_transport_conservation_on_failure(
+    reject_before_submit: bool,
+    terminal_metric: str,
+    terminal_labels: tuple[str, ...],
+    submitted: bool,
+) -> None:
+    class SourceAgent(FakeNixlAgent):
+        def transfer(self, handle):
+            if reject_before_submit:
+                self.transfers.append(handle)
+                return "ERR"
+            return super().transfer(handle)
+
+    target_agent = FakeNixlAgent(metadata=b"target-md")
+    source_agent = SourceAgent(metadata=b"source-md")
+    target_control = FakeBytesControl("tcp://target:1")
+    source_control = FakeBytesControl("tcp://source:1")
+    target = _new_kvcr(
+        target_agent,
+        FakePrimaryPinning(),
+        target_control,
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_MatchingHintAdapter(),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(),
+        source_control,
+        KVCRConfig(nixl_agent_name="source", enable_telemetry=True),
+        name="source",
+    )
+    key = BlockKey(b"failed-transfer")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+    op_handle = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(target_control.sent))
+    source_control.incoming.extend(message for _, message in target_control.sent)
+
+    assert _poll_until(source, lambda _: bool(source_agent.xfers)) == []
+    if not reject_before_submit:
+        source_agent.state = "ERR"
+    _wait_until(lambda: bool(source_agent.sent_notifs))
+    target_agent.notifs["source"] = [source_agent.sent_notifs[-1][1]]
+    assert _poll_until(target, lambda completed: bool(completed)) == [
+        (op_handle, _op_entries({key: False}))
+    ]
+
+    source_stats = source.get_stats()
+    target_stats = target.get_stats()
+    assert isinstance(source_stats, FakeTelemetryStats)
+    assert isinstance(target_stats, FakeTelemetryStats)
+    assert (
+        "counter",
+        "kvcr_source_blocks_available",
+        1,
+        (),
+    ) in source_stats.records
+    assert (
+        (
+            "counter",
+            "kvcr_transfer_blocks_submitted",
+            1,
+            (),
+        )
+        in source_stats.records
+    ) is submitted
+    assert (
+        "counter",
+        terminal_metric,
+        1,
+        terminal_labels,
+    ) in target_stats.records
+    assert not any(
+        record[0] == "counter"
+        and record[1] == TRANSFER_BLOCKS_METRIC
+        and record[3] == ("remote_deliver",)
+        for record in target_stats.records
+    )
