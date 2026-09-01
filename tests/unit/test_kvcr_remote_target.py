@@ -45,6 +45,47 @@ def _make_block_key(block_hash: bytes, group_idx: int) -> BlockKey:
     return BlockKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
 
 
+class _LogicalHashHintAdapter(_MatchingHintAdapter):
+    def logical_key(self, key: BlockKey) -> bytes:
+        return bytes(key[:-4])
+
+
+def test_remote_metrics_deduplicate_logical_blocks_across_groups_and_retries():
+    target = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl("tcp://target:1"),
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_LogicalHashHintAdapter(),
+    )
+    backend = target._core._remote_fw_dram
+    keys = (_make_block_key(b"same", 0), _make_block_key(b"same", 1))
+
+    assert backend._new_metric_identity_count("stage", keys, (), "req") == 1
+    assert backend._new_metric_identity_count("stage", keys, (), "req") == 0
+    assert backend._new_metric_identity_count("next", keys, (), "req") == 1
+
+
+def test_remote_metrics_require_all_physical_groups_for_logical_delivery():
+    target = _new_kvcr(
+        FakeNixlAgent(),
+        FakePrimaryPinning(),
+        FakeBytesControl("tcp://target:1"),
+        KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
+        key_hint_adapter=_LogicalHashHintAdapter(),
+    )
+    backend = target._core._remote_fw_dram
+    first = (_make_block_key(b"first", 0), _make_block_key(b"first", 1))
+    second = (_make_block_key(b"second", 0), _make_block_key(b"second", 1))
+
+    available, missing = backend._partition_logical_representatives(
+        first + second, first + second[:1]
+    )
+
+    assert available == first[:1]
+    assert missing == second[:1]
+
+
 def test_kvcr_opportunistic_query_accepts_key_outside_hint():
     control = FakeBytesControl("tcp://target:1")
     target = _new_kvcr(
@@ -569,6 +610,7 @@ def test_remote_framework_dram_transfers_available_prefix(
     missing_indices: tuple[int, ...],
     completed_count: int,
 ) -> None:
+    mismatches: list[tuple[str, int]] = []
     target_agent = FakeNixlAgent(metadata=b"target-md")
     source_agent = FakeNixlAgent(metadata=b"source-md")
     source_pinning = FakePrimaryPinning(missing_indices=missing_indices)
@@ -580,6 +622,9 @@ def test_remote_framework_dram_transfers_available_prefix(
         target_control,
         KVCRConfig(nixl_agent_name="target", enable_telemetry=True),
         key_hint_adapter=_MatchingHintAdapter(),
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
         remote_options=RemoteFWDramOptions(
             eager_ctrl_connect=eager_ctrl_connect,
         ),
@@ -675,10 +720,61 @@ def test_remote_framework_dram_transfers_available_prefix(
         completed_count * _mem_descriptor().size,
         ("remote_deliver",),
     ) in target_stats.records
-    if missing_indices:
-        assert (
-            "counter",
-            "kvcr_transfer_blocks_failed",
-            len(missing_indices),
-            ("source_missing",),
-        ) in target_stats.records
+    assert not any(
+        record[0] == "counter" and record[1] == "kvcr_transfer_blocks_failed"
+        for record in target_stats.records
+    )
+    assert mismatches == (
+        [("source_missing", len(missing_indices))] if missing_indices else []
+    )
+
+
+def test_remote_framework_dram_rejects_stale_source_inventory_epoch() -> None:
+    target_agent = FakeNixlAgent(metadata=b"target-md")
+    source_agent = FakeNixlAgent(metadata=b"source-md")
+    target_control = FakeBytesControl("tcp://target:1")
+    source_control = FakeBytesControl("tcp://source:1")
+    mismatches: list[tuple[str, int]] = []
+    target = _new_kvcr(
+        target_agent,
+        FakePrimaryPinning(),
+        target_control,
+        key_hint_adapter=_MatchingHintAdapter(),
+        inventory_mismatch_sink=lambda reason, blocks: mismatches.append(
+            (reason, blocks)
+        ),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    source = _new_kvcr(
+        source_agent,
+        FakePrimaryPinning(),
+        source_control,
+        KVCRConfig(nixl_agent_name="source", inventory_epoch=8),
+        name="source",
+    )
+    key = BlockKey(b"k0")
+    target.submit_hint(
+        (),
+        src="tcp://source:1",
+        request_id="req",
+        hints="hint",
+        source_inventory_epoch=7,
+    )
+    op_handle = target.deliver({key: _mem_descriptor()}, request_id="req")
+    _wait_until(lambda: bool(target_control.sent))
+    payload = _decode_control_message(target_control.sent[-1][1])
+    assert payload["source_inventory_epoch"] == 7
+    assert payload["request_id"] == "req"
+    source_control.incoming.append(target_control.sent[-1][1])
+
+    assert _poll_until(source, lambda _: bool(source_agent.sent_notifs)) == []
+    _, notification = source_agent.sent_notifs.pop()
+    target_agent.notifs["source"] = [notification]
+    [(completed_handle, entries)] = _poll_until(
+        target, lambda completed: bool(completed)
+    )
+
+    assert completed_handle == op_handle
+    assert not entries[key].success
+    assert source_agent.xfers == []
+    assert mismatches == [("epoch_mismatch", 1)]

@@ -13,6 +13,7 @@ from .types import (
 )
 
 InventorySink = Callable[[InventoryEvent], None]
+InventoryMismatchSink = Callable[[str, int], None]
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,8 @@ class KeyHintAdapter(Protocol):
 
     def matches(self, key: BlockKey, hint: object) -> bool: ...
 
+    def logical_key(self, key: BlockKey) -> object: ...
+
 
 @dataclass(frozen=True)
 class KVCRConfig:
@@ -108,6 +111,7 @@ class KVCRConfig:
     inventory_report_interval_ms: int = 10
     capacity_low_watermark_percent: float = 0
     nixl_listen_port: int | None = None
+    inventory_epoch: int | None = None
 
 
 @dataclass(frozen=True)

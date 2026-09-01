@@ -124,6 +124,11 @@ class _KVCRCore:
             raise ValueError("inventory_report_interval_ms must be non-negative")
         if not 0 <= self.config.capacity_low_watermark_percent <= 100:
             raise ValueError("capacity_low_watermark_percent must be between 0 and 100")
+        if self.config.inventory_epoch is not None and (
+            isinstance(self.config.inventory_epoch, bool)
+            or not 0 <= self.config.inventory_epoch < 2**64
+        ):
+            raise ValueError("inventory_epoch must be an unsigned 64-bit integer")
 
         self.nixl_agent_name = self.config.nixl_agent_name
         self._request_pin_callback = bindings.request_pin
@@ -132,6 +137,7 @@ class _KVCRCore:
         self._cancel_pin_request_callback = bindings.cancel_pin_request
         self.framework_control = bindings.framework_control
         self._inventory_sink_callback = bindings.inventory_sink
+        self._inventory_mismatch_sink_callback = bindings.inventory_mismatch_sink
         self._capacity_needed_callback = bindings.capacity_needed_callback
         self._stats_factory = bindings.stats_factory
         local_dram_config = backend_configs.local_dram
@@ -265,6 +271,7 @@ class _KVCRCore:
         mode: str = "copy",
         hints: object | None = None,
         request_id: str | None = None,
+        source_inventory_epoch: int | None = None,
     ) -> None:
         # TODO: Let policy consume mode="move" and no_retain hints.
         if mode != "copy":
@@ -277,7 +284,7 @@ class _KVCRCore:
         # Only the request-scoped source and opaque hint are currently used by
         # remote-G2 query, fetch, and deliver. Proactive copy or move using the
         # block list is not implemented.
-        self._remote_fw_dram.submit_hint(src, hints, request_id)
+        self._remote_fw_dram.submit_hint(src, hints, request_id, source_inventory_epoch)
 
     def discard_hint(self, request_id: str) -> None:
         self._remote_fw_dram.discard_hint(request_id)

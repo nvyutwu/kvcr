@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from .config import (
     FrameworkControl,
+    InventoryMismatchSink,
     InventorySink,
     KeyHintAdapter,
     KVCRBackendConfigs,
@@ -66,6 +67,7 @@ class KVCRBindings:
     framework_control: FrameworkControl | None = None
     key_hint_adapter: KeyHintAdapter | None = None
     inventory_sink: InventorySink | None = None
+    inventory_mismatch_sink: InventoryMismatchSink | None = None
 
     # Capacity pressure, telemetry, and placement policy.
     capacity_needed_callback: Callable[[int], None] | None = None
@@ -126,6 +128,7 @@ class KVCR:
         mode: str = "copy",
         hints: object | None = None,
         request_id: str | None = None,
+        source_inventory_epoch: int | None = None,
     ) -> None:
         """Submit request-scoped router hints."""
         self._core.submit_hint(
@@ -134,6 +137,7 @@ class KVCR:
             mode=mode,
             hints=hints,
             request_id=request_id,
+            source_inventory_epoch=source_inventory_epoch,
         )
 
     def discard_hint(self, request_id: str) -> None:

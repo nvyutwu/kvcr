@@ -13,6 +13,7 @@ Source: start_write -> local claim/framework pin -> write -> write_done.
 
 import math
 import time
+from collections import OrderedDict
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
@@ -62,6 +63,7 @@ class _RequestHint:
     source: str
     value: object
     submitted_at: float | None
+    source_inventory_epoch: int | None = None
     failed: bool = False
 
 
@@ -99,6 +101,7 @@ class _TargetPullOp(_RemoteOp):
     ordered_keys: tuple[BlockKey, ...] = ()
     dst_descriptors: tuple[MemDescriptor, ...] = ()
     request_id: str | None = None
+    source_inventory_epoch: int | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
 
@@ -123,6 +126,8 @@ class _TargetPullOp(_RemoteOp):
                     "remaining_timeout_ms": (self.deadline - now) * 1000,
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
+                    "request_id": self.request_id,
+                    "source_inventory_epoch": self.source_inventory_epoch,
                 },
             )
             if not sent:
@@ -161,11 +166,15 @@ class _TargetPullOp(_RemoteOp):
             self.success = success
             self.completed_keys = completed_keys
             self.state = _TargetPullState.FINISHED
-            if completed_keys:
-                backend._record_progress_counter(
+            logical_completed_keys, _ = backend._partition_logical_representatives(
+                self.ordered_keys, completed_keys
+            )
+            if logical_completed_keys:
+                backend._record_distinct_progress_counter(
                     TRANSFER_BLOCKS_METRIC,
-                    len(completed_keys),
+                    logical_completed_keys,
                     (scope,),
+                    self.request_id,
                 )
                 # Descriptors are positionally aligned with ordered_keys, so
                 # count only the bytes for keys confirmed delivered.
@@ -180,13 +189,20 @@ class _TargetPullOp(_RemoteOp):
                     ),
                     (scope,),
                 )
-            failed_count = len(self.keys) - len(completed_keys)
-            if failed_count:
-                backend._record_progress_counter(
-                    TRANSFER_BLOCKS_FAILED_METRIC,
-                    failed_count,
-                    ("source_missing" if success else "transport",),
-                )
+            mismatch_reason = event.get("inventory_mismatch_reason")
+            if mismatch_reason in {
+                "source_missing",
+                "epoch_mismatch",
+                "worker_unreachable",
+                "layout_mismatch",
+            }:
+                sink = backend._kvcr._inventory_mismatch_sink_callback
+                if sink is not None:
+                    missing_keys = self.keys - completed_keys
+                    sink(
+                        str(mismatch_reason),
+                        len({backend._logical_identity(key) for key in missing_keys}),
+                    )
             result = (
                 "success"
                 if all_completed
@@ -226,6 +242,7 @@ class _SourcePinOp(_Op):
     dst_descriptors: tuple[MemDescriptor, ...]
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
+    request_id: str | None = None
 
 
 @dataclass
@@ -251,6 +268,9 @@ class _SourceWriteOp(_RemoteOp):
     transfer_id: int | None = None
     success: bool = False
     completed_count: int = 0
+    request_id: str | None = None
+    was_submitted: bool = False
+    logical_metric_keys: tuple[BlockKey, ...] = ()
 
     def progress(
         self, progress: _KVCRProgress, _event: object | None
@@ -262,6 +282,16 @@ class _SourceWriteOp(_RemoteOp):
                 self.state is _SourceWriteState.NOTIFY_FAILURE
                 or backend._kvcr._clock() >= self.deadline
             ):
+                if (
+                    self.state is not _SourceWriteState.NOTIFY_FAILURE
+                    and self.completed_count
+                ):
+                    backend._record_distinct_progress_counter(
+                        BLOCKS_CANCELLED_METRIC,
+                        self.logical_metric_keys,
+                        ("before_submit",),
+                        self.request_id,
+                    )
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
@@ -284,6 +314,11 @@ class _SourceWriteOp(_RemoteOp):
                         self.op_handle,
                         True,
                         completed_count=self.completed_count,
+                        inventory_mismatch_reason=(
+                            "source_missing"
+                            if self.completed_count < len(self.ordered_keys)
+                            else None
+                        ),
                     ),
                     capture_telemetry=backend._telemetry_enabled,
                 )
@@ -302,11 +337,19 @@ class _SourceWriteOp(_RemoteOp):
                         "KVCR start_write submission failed for op=%d",
                         self.op_handle,
                     )
+                    backend._record_distinct_progress_counter(
+                        BLOCKS_CANCELLED_METRIC,
+                        self.logical_metric_keys,
+                        ("before_submit",),
+                        self.request_id,
+                    )
                 else:
-                    backend._record_progress_counter(
+                    self.was_submitted = True
+                    backend._record_distinct_progress_counter(
                         TRANSFER_BLOCKS_SUBMITTED_METRIC,
-                        self.completed_count,
+                        self.logical_metric_keys,
                         (),
+                        self.request_id,
                     )
                 observed_work = True
             except Exception:
@@ -319,6 +362,12 @@ class _SourceWriteOp(_RemoteOp):
                     "transfer_submit", submit_started_at, "failed"
                 )
                 self.success = False
+                backend._record_distinct_progress_counter(
+                    BLOCKS_CANCELLED_METRIC,
+                    self.logical_metric_keys,
+                    ("before_submit",),
+                    self.request_id,
+                )
                 backend._send_write_done(
                     progress, self.remote_agent, self.op_handle, False
                 )
@@ -337,9 +386,10 @@ class _SourceWriteOp(_RemoteOp):
         ):
             self.state = _SourceWriteState.CANCEL_PENDING
             observed_work = True
+        cancellation_requested = self.state is _SourceWriteState.CANCEL_PENDING
         transfer_result = progress.poll_transfer(
             transfer_id,
-            cancellation_requested=self.state is _SourceWriteState.CANCEL_PENDING,
+            cancellation_requested=cancellation_requested,
         )
         if transfer_result is None:
             return False, observed_work
@@ -347,12 +397,26 @@ class _SourceWriteOp(_RemoteOp):
         success, telemetry = transfer_result
         if success:
             backend._record_transfer_telemetry(telemetry)
-            backend._record_progress_counter(
+            backend._record_distinct_progress_counter(
                 TRANSFER_BLOCKS_METRIC,
-                len(self.keys),
+                self.logical_metric_keys,
                 ("source_write",),
+                self.request_id,
             )
         else:
+            if self.was_submitted:
+                metric = (
+                    BLOCKS_CANCELLED_METRIC
+                    if cancellation_requested
+                    else TRANSFER_BLOCKS_FAILED_METRIC
+                )
+                labels = ("in_flight",) if cancellation_requested else ("transport",)
+                backend._record_distinct_progress_counter(
+                    metric,
+                    self.logical_metric_keys,
+                    labels,
+                    self.request_id,
+                )
             backend._send_write_done(progress, self.remote_agent, self.op_handle, False)
         result = "success" if success else "failed"
         backend._record_progress_duration("source_write", self.started_at, result)
@@ -364,10 +428,11 @@ class _SourceWriteOp(_RemoteOp):
         if self.transfer_id is not None:
             if not progress.cancel_transfer(self.transfer_id):
                 return False
-            self._backend._record_progress_counter(
+            self._backend._record_distinct_progress_counter(
                 BLOCKS_CANCELLED_METRIC,
-                len(self.keys),
+                self.logical_metric_keys,
                 ("in_flight",),
+                self.request_id,
             )
             self.transfer_id = None
         return True
@@ -433,6 +498,9 @@ class _RemoteFWDram:
         self._metadata_retry_after: dict[str, float] = {}
         self._next_source_op_id = 1
         self._control = kvcr.framework_control
+        self._metric_seen: OrderedDict[
+            str, dict[tuple[str, tuple[str, ...]], set[object]]
+        ] = OrderedDict()
 
     # -------------------------------------------------------------------------
     # Backend interface used by KVCR.
@@ -443,6 +511,7 @@ class _RemoteFWDram:
         src: str | None,
         hints: object | None,
         request_id: str | None,
+        source_inventory_epoch: int | None,
     ) -> None:
         kvcr = self._kvcr
         if request_id is not None:
@@ -464,6 +533,15 @@ class _RemoteFWDram:
                         previous.submitted_at
                         if previous is not None and previous.submitted_at is not None
                         else kvcr._timer()
+                    ),
+                    source_inventory_epoch=(
+                        source_inventory_epoch
+                        if source_inventory_epoch is not None
+                        else (
+                            previous.source_inventory_epoch
+                            if previous is not None
+                            else None
+                        )
                     ),
                 )
         if not isinstance(src, str) or not src:
@@ -522,6 +600,7 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=tuple(blocks[key] for key in keys),
             request_id=request_id,
+            source_inventory_epoch=current_hint.source_inventory_epoch,
         )
         kvcr._add_block_dependencies(op, new_operation=True)
         kvcr._progress.submit(op)
@@ -877,6 +956,18 @@ class _RemoteFWDram:
             dst_descriptors = msgspec.convert(
                 payload["dst_descriptors"], type=_MEM_DESCRIPTORS_TYPE
             )
+            source_inventory_epoch = payload.get("source_inventory_epoch")
+            request_id = payload.get("request_id")
+            if request_id is not None and (
+                not isinstance(request_id, str) or not request_id
+            ):
+                raise TypeError("invalid request_id")
+            if source_inventory_epoch is not None and (
+                isinstance(source_inventory_epoch, bool)
+                or not isinstance(source_inventory_epoch, int)
+                or not 0 <= source_inventory_epoch < 2**64
+            ):
+                raise TypeError("invalid source_inventory_epoch")
         except (KeyError, TypeError, ValueError, msgspec.ValidationError):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
@@ -884,6 +975,19 @@ class _RemoteFWDram:
         if not keys or len(keys) != len(dst_descriptors):
             logger.warning("KVCR malformed start_write op=%d", op_handle)
             self._notify_start_write_failure(progress, payload, op_handle)
+            return
+
+        if (
+            source_inventory_epoch is not None
+            and source_inventory_epoch != self._kvcr.config.inventory_epoch
+        ):
+            logger.warning("KVCR stale inventory epoch for op=%d", op_handle)
+            self._notify_start_write_failure(
+                progress,
+                payload,
+                op_handle,
+                inventory_mismatch_reason="epoch_mismatch",
+            )
             return
 
         remaining_timeout_ms = min(
@@ -916,6 +1020,7 @@ class _RemoteFWDram:
                 op_handle=op_handle,
                 ordered_keys=keys,
                 dst_descriptors=dst_descriptors,
+                request_id=request_id,
             )
         )
 
@@ -944,19 +1049,25 @@ class _RemoteFWDram:
                 break
             completed_keys = source_pin.ordered_keys[: index + 1]
 
-        stats = kvcr._stats
-        if stats is not None:
-            if completed_keys:
-                stats.increase_counter(
-                    SOURCE_BLOCKS_AVAILABLE_METRIC, len(completed_keys), ()
-                )
-            missing_count = len(source_pin.ordered_keys) - len(completed_keys)
-            if missing_count:
-                stats.increase_counter(
-                    SOURCE_BLOCKS_MISSING_METRIC,
-                    missing_count,
-                    ("source_missing",),
-                )
+        logical_available_keys, logical_missing_keys = (
+            self._partition_logical_representatives(
+                source_pin.ordered_keys, completed_keys
+            )
+        )
+        if logical_available_keys:
+            self._record_distinct_counter(
+                SOURCE_BLOCKS_AVAILABLE_METRIC,
+                logical_available_keys,
+                (),
+                source_pin.request_id,
+            )
+        if logical_missing_keys:
+            self._record_distinct_counter(
+                SOURCE_BLOCKS_MISSING_METRIC,
+                logical_missing_keys,
+                ("source_missing",),
+                source_pin.request_id,
+            )
 
         kvcr._release_local_dram_sources(
             source_pin.op_id, local_sources.keys() - set(completed_keys)
@@ -992,6 +1103,8 @@ class _RemoteFWDram:
             framework_pins=framework_pins,
             src_descriptors=tuple(sources[key] for key in completed_keys),
             completed_count=len(completed_keys),
+            request_id=source_pin.request_id,
+            logical_metric_keys=logical_available_keys,
         )
         kvcr._add_block_dependencies(source_write, new_operation=True)
         self._fw_pins_by_op[source_write.op_id] = set(source_write.framework_pins)
@@ -1003,6 +1116,7 @@ class _RemoteFWDram:
         progress: _KVCRProgress,
         payload: Mapping[str, Any],
         op_handle: OpHandle,
+        inventory_mismatch_reason: str | None = None,
     ) -> None:
         try:
             _, remote_agent = self._remote_agent(progress, payload)
@@ -1013,7 +1127,13 @@ class _RemoteFWDram:
                 exc_info=True,
             )
             return
-        self._send_write_done(progress, remote_agent, op_handle, False)
+        self._send_write_done(
+            progress,
+            remote_agent,
+            op_handle,
+            False,
+            inventory_mismatch_reason=inventory_mismatch_reason,
+        )
 
     # Shared framework-pin coordination.
 
@@ -1490,6 +1610,75 @@ class _RemoteFWDram:
         if self._telemetry_enabled:
             self._progress_metrics.append(("counter", name, value, labels))
 
+    def _logical_identity(self, key: BlockKey) -> object:
+        logical_key = getattr(self._key_hint_adapter, "logical_key", None)
+        identity = logical_key(key) if logical_key is not None else key
+        try:
+            hash(identity)
+        except TypeError:
+            return key
+        return identity
+
+    def _partition_logical_representatives(
+        self,
+        requested_keys: Collection[BlockKey],
+        completed_keys: Collection[BlockKey],
+    ) -> tuple[tuple[BlockKey, ...], tuple[BlockKey, ...]]:
+        completed = set(completed_keys)
+        by_identity: OrderedDict[object, list[BlockKey]] = OrderedDict()
+        for key in requested_keys:
+            by_identity.setdefault(self._logical_identity(key), []).append(key)
+        available: list[BlockKey] = []
+        missing: list[BlockKey] = []
+        for physical_keys in by_identity.values():
+            destination = (
+                available if all(key in completed for key in physical_keys) else missing
+            )
+            destination.append(physical_keys[0])
+        return tuple(available), tuple(missing)
+
+    def _new_metric_identity_count(
+        self,
+        name: str,
+        keys: Collection[BlockKey],
+        labels: tuple[str, ...],
+        request_id: str | None,
+    ) -> int:
+        identities = {self._logical_identity(key) for key in keys}
+        if request_id is None:
+            return len(identities)
+        request_state = self._metric_seen.setdefault(request_id, {})
+        self._metric_seen.move_to_end(request_id)
+        while len(self._metric_seen) > 4096:
+            self._metric_seen.popitem(last=False)
+        seen = request_state.setdefault((name, labels), set())
+        new_identities = identities - seen
+        seen.update(new_identities)
+        return len(new_identities)
+
+    def _record_distinct_counter(
+        self,
+        name: str,
+        keys: Collection[BlockKey],
+        labels: tuple[str, ...],
+        request_id: str | None,
+    ) -> None:
+        count = self._new_metric_identity_count(name, keys, labels, request_id)
+        stats = self._kvcr._stats
+        if count and stats is not None:
+            stats.increase_counter(name, count, labels)
+
+    def _record_distinct_progress_counter(
+        self,
+        name: str,
+        keys: Collection[BlockKey],
+        labels: tuple[str, ...],
+        request_id: str | None,
+    ) -> None:
+        count = self._new_metric_identity_count(name, keys, labels, request_id)
+        if count:
+            self._record_progress_counter(name, count, labels)
+
     def _apply_progress_update(self, update: _ProgressUpdate) -> None:
         self._connected_remote_count = update.connected_remote_count
         stats = self._kvcr._stats
@@ -1507,6 +1696,7 @@ class _RemoteFWDram:
         remote_agent: bytes,
         op_handle: OpHandle,
         success: bool,
+        inventory_mismatch_reason: str | None = None,
     ) -> None:
         agent = progress.nixl_agent
         send_notif = getattr(agent, "send_notif", None)
@@ -1517,7 +1707,14 @@ class _RemoteFWDram:
             )
             return
         try:
-            result = send_notif(remote_agent, _write_done_notif(op_handle, success))
+            result = send_notif(
+                remote_agent,
+                _write_done_notif(
+                    op_handle,
+                    success,
+                    inventory_mismatch_reason=inventory_mismatch_reason,
+                ),
+            )
         except Exception:
             logger.warning(
                 "KVCR write_done notification failed for op=%d",
@@ -1549,6 +1746,7 @@ def _write_done_notif(
     op_handle: OpHandle,
     success: bool,
     completed_count: int | None = None,
+    inventory_mismatch_reason: str | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": "write_done",
@@ -1557,6 +1755,8 @@ def _write_done_notif(
     }
     if completed_count is not None:
         payload["completed_count"] = completed_count
+    if inventory_mismatch_reason is not None:
+        payload["inventory_mismatch_reason"] = inventory_mismatch_reason
     return _NOTIF_PREFIX + msgspec.msgpack.encode(payload)
 
 
