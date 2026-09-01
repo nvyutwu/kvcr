@@ -268,12 +268,10 @@ def test_remote_invalid_completed_layout_is_source_mismatch() -> None:
     ]
     stats = target.get_stats()
     assert isinstance(stats, FakeTelemetryStats)
-    assert (
-        "counter",
-        "kvcr_source_blocks_missing",
-        1,
-        ("layout_mismatch",),
-    ) in stats.records
+    assert not any(
+        record[0] == "counter" and record[1] == "kvcr_source_blocks_missing"
+        for record in stats.records
+    )
     assert mismatches == [("layout_mismatch", 1)]
 
 

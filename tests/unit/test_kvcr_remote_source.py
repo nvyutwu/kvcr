@@ -248,14 +248,22 @@ def test_kvcr_missing_source_is_counted_when_terminal_notification_is_lost(
         )
         == []
     )
-    stats = source.get_stats()
-    assert isinstance(stats, FakeTelemetryStats)
-    assert (
+    expected_missing = (
         "counter",
         SOURCE_BLOCKS_MISSING_METRIC,
         1,
         ("source_missing",),
-    ) in stats.records
+    )
+
+    def missing_metric_applied() -> bool:
+        assert list(source.poll_completed()) == []
+        current = source._core._stats
+        return current is not None and expected_missing in current.records
+
+    _wait_until(missing_metric_applied)
+    stats = source.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert expected_missing in stats.records
     assert not any(
         record[0] == "counter"
         and record[1]
@@ -300,14 +308,22 @@ def test_kvcr_source_setup_failure_is_pre_transport_unavailable(
         )
         == []
     )
-    stats = source.get_stats()
-    assert isinstance(stats, FakeTelemetryStats)
-    assert (
+    expected_unreachable = (
         "counter",
         SOURCE_BLOCKS_MISSING_METRIC,
         1,
         ("worker_unreachable",),
-    ) in stats.records
+    )
+
+    def unreachable_metric_applied() -> bool:
+        assert list(source.poll_completed()) == []
+        current = source._core._stats
+        return current is not None and expected_unreachable in current.records
+
+    _wait_until(unreachable_metric_applied)
+    stats = source.get_stats()
+    assert isinstance(stats, FakeTelemetryStats)
+    assert expected_unreachable in stats.records
     assert not any(
         record[0] == "counter"
         and record[1]

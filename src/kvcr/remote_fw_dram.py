@@ -200,10 +200,8 @@ class _TargetPullOp(_RemoteOp):
             # attempt progressed.  The target consumes the terminal result but
             # must not duplicate or infer attempt-stage metrics from it.
             if layout_mismatch:
-                backend._record_inventory_mismatch(
-                    logical_missing_keys,
-                    "layout_mismatch",
-                    self.request_id,
+                backend._report_inventory_mismatch(
+                    logical_missing_keys, "layout_mismatch"
                 )
             self.terminal_recorded = True
             result = (
