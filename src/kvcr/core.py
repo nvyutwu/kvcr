@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 DURATION_METRIC = "kvcr_duration_seconds"
 TRANSFER_BYTES_METRIC = "kvcr_transfer_bytes"
 TRANSFER_BLOCKS_METRIC = "kvcr_transfer_blocks"
+TRANSFER_BLOCKS_SUBMITTED_METRIC = "kvcr_transfer_blocks_submitted"
+TRANSFER_BLOCKS_FAILED_METRIC = "kvcr_transfer_blocks_failed"
+SOURCE_BLOCKS_AVAILABLE_METRIC = "kvcr_source_blocks_available"
+SOURCE_BLOCKS_MISSING_METRIC = "kvcr_source_blocks_missing"
+BLOCKS_CANCELLED_METRIC = "kvcr_blocks_cancelled"
 STATE_METRIC = "kvcr_state"
 
 _Timer = Callable[[], float | None]

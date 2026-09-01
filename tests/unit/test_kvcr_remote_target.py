@@ -646,7 +646,39 @@ def test_remote_framework_dram_transfers_available_prefix(
     ) in source_stats.records
     assert (
         "counter",
+        "kvcr_source_blocks_available",
+        completed_count,
+        (),
+    ) in source_stats.records
+    if missing_indices:
+        assert (
+            "counter",
+            "kvcr_source_blocks_missing",
+            len(missing_indices),
+            ("source_missing",),
+        ) in source_stats.records
+    assert (
+        "counter",
+        "kvcr_transfer_blocks_submitted",
+        completed_count,
+        (),
+    ) in source_stats.records
+    assert (
+        "counter",
         TRANSFER_BLOCKS_METRIC,
         completed_count,
         ("remote_deliver",),
     ) in target_stats.records
+    assert (
+        "counter",
+        TRANSFER_BYTES_METRIC,
+        completed_count * _mem_descriptor().size,
+        ("remote_deliver",),
+    ) in target_stats.records
+    if missing_indices:
+        assert (
+            "counter",
+            "kvcr_transfer_blocks_failed",
+            len(missing_indices),
+            ("source_missing",),
+        ) in target_stats.records

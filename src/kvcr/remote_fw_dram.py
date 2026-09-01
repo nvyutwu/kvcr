@@ -22,8 +22,13 @@ import msgspec
 
 from .config import KeyHintAdapter, RemoteFWDramOptions
 from .core import (
+    BLOCKS_CANCELLED_METRIC,
     DURATION_METRIC,
+    SOURCE_BLOCKS_AVAILABLE_METRIC,
+    SOURCE_BLOCKS_MISSING_METRIC,
+    TRANSFER_BLOCKS_FAILED_METRIC,
     TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BLOCKS_SUBMITTED_METRIC,
     TRANSFER_BYTES_METRIC,
     logger,
 )
@@ -162,6 +167,26 @@ class _TargetPullOp(_RemoteOp):
                     len(completed_keys),
                     (scope,),
                 )
+                # Descriptors are positionally aligned with ordered_keys, so
+                # count only the bytes for keys confirmed delivered.
+                backend._record_progress_counter(
+                    TRANSFER_BYTES_METRIC,
+                    sum(
+                        descriptor.size
+                        for key, descriptor in zip(
+                            self.ordered_keys, self.dst_descriptors
+                        )
+                        if key in completed_keys
+                    ),
+                    (scope,),
+                )
+            failed_count = len(self.keys) - len(completed_keys)
+            if failed_count:
+                backend._record_progress_counter(
+                    TRANSFER_BLOCKS_FAILED_METRIC,
+                    failed_count,
+                    ("source_missing" if success else "transport",),
+                )
             result = (
                 "success"
                 if all_completed
@@ -277,6 +302,12 @@ class _SourceWriteOp(_RemoteOp):
                         "KVCR start_write submission failed for op=%d",
                         self.op_handle,
                     )
+                else:
+                    backend._record_progress_counter(
+                        TRANSFER_BLOCKS_SUBMITTED_METRIC,
+                        self.completed_count,
+                        (),
+                    )
                 observed_work = True
             except Exception:
                 logger.warning(
@@ -333,6 +364,11 @@ class _SourceWriteOp(_RemoteOp):
         if self.transfer_id is not None:
             if not progress.cancel_transfer(self.transfer_id):
                 return False
+            self._backend._record_progress_counter(
+                BLOCKS_CANCELLED_METRIC,
+                len(self.keys),
+                ("in_flight",),
+            )
             self.transfer_id = None
         return True
 
@@ -907,6 +943,20 @@ class _RemoteFWDram:
             if key not in sources:
                 break
             completed_keys = source_pin.ordered_keys[: index + 1]
+
+        stats = kvcr._stats
+        if stats is not None:
+            if completed_keys:
+                stats.increase_counter(
+                    SOURCE_BLOCKS_AVAILABLE_METRIC, len(completed_keys), ()
+                )
+            missing_count = len(source_pin.ordered_keys) - len(completed_keys)
+            if missing_count:
+                stats.increase_counter(
+                    SOURCE_BLOCKS_MISSING_METRIC,
+                    missing_count,
+                    ("source_missing",),
+                )
 
         kvcr._release_local_dram_sources(
             source_pin.op_id, local_sources.keys() - set(completed_keys)
