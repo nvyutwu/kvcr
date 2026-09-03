@@ -34,6 +34,7 @@ from kvcr import (
     TRANSFER_BYTES_METRIC,
 )
 from kvcr.config import KVCRConfig, LocalDramInfo, RemoteFWDramOptions
+from kvcr.remote_fw_dram import _format_p2p_descriptor_fingerprints
 from kvcr.types import (
     BlockKey,
     CacheTier,
@@ -47,6 +48,23 @@ from kvcr.types import (
 
 def _make_block_key(block_hash: bytes, group_idx: int) -> BlockKey:
     return BlockKey(block_hash + group_idx.to_bytes(4, "big", signed=False))
+
+
+def test_p2p_descriptor_fingerprints_cover_each_physical_group() -> None:
+    first = (ctypes.c_ubyte * 256)(*range(256))
+    second = (ctypes.c_ubyte * 256)(*((255 - index) for index in range(256)))
+    keys = (_make_block_key(b"same", 0), _make_block_key(b"same", 1))
+    descriptors = (
+        _mem_descriptor(addr=ctypes.addressof(first), size=256),
+        _mem_descriptor(addr=ctypes.addressof(second), size=256),
+    )
+
+    before = _format_p2p_descriptor_fingerprints(keys, descriptors)
+    assert "g0:s256:sha256=" in before
+    assert "g1:s256:sha256=" in before
+
+    second[128] ^= 0xFF
+    assert _format_p2p_descriptor_fingerprints(keys, descriptors) != before
 
 
 class _LogicalHashHintAdapter(_MatchingHintAdapter):
