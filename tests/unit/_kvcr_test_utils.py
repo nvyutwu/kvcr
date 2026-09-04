@@ -382,6 +382,7 @@ def _start_write_message(
     *,
     target_agent: str | None = None,
     remaining_timeout_ms: float = 1000,
+    operation_tag: str | None = None,
 ) -> bytes:
     payload: dict[str, Any] = {
         "type": "start_write",
@@ -393,6 +394,8 @@ def _start_write_message(
     }
     if target_agent is not None:
         payload["target_agent"] = target_agent
+    if operation_tag is not None:
+        payload["operation_tag"] = operation_tag
     return msgspec.msgpack.encode(payload)
 
 
@@ -409,6 +412,7 @@ def _new_kvcr(
     inventory_sink=None,
     inventory_mismatch_sink=None,
     policy=None,
+    prepare_extra_write=None,
 ) -> KVCR:
     config = replace(
         config or KVCRConfig(nixl_agent_name=name, inventory_report_interval_ms=0),
@@ -423,6 +427,7 @@ def _new_kvcr(
                 poll_pin_results=pinning.poll_pin_results,
                 release_pin=pinning.release_pin,
                 cancel_pin_request=getattr(pinning, "cancel_pin_request", None),
+                prepare_extra_write=prepare_extra_write,
                 framework_control=control,
                 key_hint_adapter=key_hint_adapter,
                 inventory_sink=inventory_sink,

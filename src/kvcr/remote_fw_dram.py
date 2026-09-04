@@ -160,6 +160,7 @@ class _TargetPullOp(_RemoteOp):
     ordered_keys: tuple[BlockKey, ...] = ()
     dst_descriptors: tuple[MemDescriptor, ...] = ()
     request_id: str | None = None
+    operation_tag: str | None = None
     source_inventory_epoch: int | None = None
     success: bool = False
     completed_keys: set[BlockKey] = field(default_factory=set)
@@ -191,6 +192,7 @@ class _TargetPullOp(_RemoteOp):
                     "keys": list(self.ordered_keys),
                     "dst_descriptors": self.dst_descriptors,
                     "request_id": self.request_id,
+                    "operation_tag": self.operation_tag,
                     "source_inventory_epoch": self.source_inventory_epoch,
                 },
             )
@@ -335,6 +337,7 @@ class _SourcePinOp(_Op):
     framework_pins: set[PinHandle] = field(default_factory=set)
     pending_pin_ids: set[PinRequestId] = field(default_factory=set)
     request_id: str | None = None
+    operation_tag: str | None = None
 
 
 @dataclass
@@ -361,6 +364,7 @@ class _SourceWriteOp(_RemoteOp):
     success: bool = False
     completed_count: int = 0
     request_id: str | None = None
+    operation_tag: str | None = None
     was_submitted: bool = False
     logical_metric_keys: tuple[BlockKey, ...] = ()
     cancelled_stage: str | None = None
@@ -700,6 +704,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         *,
         local_fill: bool,
+        operation_tag: str | None = None,
     ) -> bool:
         kvcr = self._kvcr
         started_at = kvcr._timer()
@@ -731,6 +736,7 @@ class _RemoteFWDram:
             ordered_keys=keys,
             dst_descriptors=tuple(blocks[key] for key in keys),
             request_id=request_id,
+            operation_tag=operation_tag,
             source_inventory_epoch=current_hint.source_inventory_epoch,
         )
         kvcr._add_block_dependencies(op, new_operation=True)
@@ -742,6 +748,7 @@ class _RemoteFWDram:
         op_handle: OpHandle,
         blocks: Mapping[BlockKey, MemDescriptor],
         request_id: str | None,
+        operation_tag: str | None = None,
         *,
         deadline: float,
     ) -> None:
@@ -755,6 +762,7 @@ class _RemoteFWDram:
             deadline,
             op_handle,
             local_fill=False,
+            operation_tag=operation_tag,
         ):
             return
         kvcr._complete(
@@ -1093,6 +1101,11 @@ class _RemoteFWDram:
                 not isinstance(request_id, str) or not request_id
             ):
                 raise TypeError("invalid request_id")
+            operation_tag = payload.get("operation_tag")
+            if operation_tag is not None and (
+                not isinstance(operation_tag, str) or not operation_tag
+            ):
+                raise TypeError("invalid operation_tag")
             if source_inventory_epoch is not None and (
                 isinstance(source_inventory_epoch, bool)
                 or not isinstance(source_inventory_epoch, int)
@@ -1167,6 +1180,7 @@ class _RemoteFWDram:
                 ordered_keys=keys,
                 dst_descriptors=dst_descriptors,
                 request_id=request_id,
+                operation_tag=operation_tag,
             )
         )
 
@@ -1227,11 +1241,42 @@ class _RemoteFWDram:
         framework_pins = source_pin.framework_pins & relevant_pins
         unused_pins = source_pin.framework_pins - framework_pins
         source_pin.framework_pins.clear()
+        extra_segment_preparation_failed = False
+        if source_pin.operation_tag is not None:
+            callback = kvcr._prepare_extra_write_callback
+            prepared = False
+            if callback is not None and len(completed_keys) == len(
+                source_pin.ordered_keys
+            ):
+                try:
+                    prepared = callback(
+                        source_pin.operation_tag,
+                        source_pin.ordered_keys,
+                        {key: sources[key] for key in completed_keys},
+                        framework_pins,
+                    )
+                except Exception:
+                    logger.warning(
+                        "KVCR extra framework segment preparation failed",
+                        exc_info=True,
+                    )
+            if not prepared:
+                # A tagged transfer is rank-complete only when the framework
+                # extension accepted its missing segment. Never permit the
+                # scheduler-owned row alone to reach the target.
+                extra_segment_preparation_failed = len(completed_keys) == len(
+                    source_pin.ordered_keys
+                )
+                completed_keys = ()
+                unused_pins |= framework_pins
+                framework_pins = set()
         self._source_pin_ops.pop(op_id, None)
         kvcr._remove_block_dependencies(source_pin)
         inventory_mismatch_reason = (
             "source_validation_timeout"
             if force_failure
+            else "rank_complete_prepare_failed"
+            if extra_segment_preparation_failed
             else "source_missing"
             if not completed_keys
             else None
@@ -1256,6 +1301,7 @@ class _RemoteFWDram:
             src_descriptors=tuple(sources[key] for key in completed_keys),
             completed_count=len(completed_keys),
             request_id=source_pin.request_id,
+            operation_tag=source_pin.operation_tag,
             logical_metric_keys=logical_available_keys,
             inventory_mismatch_reason=inventory_mismatch_reason,
         )

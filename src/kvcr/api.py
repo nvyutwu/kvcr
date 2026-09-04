@@ -74,6 +74,22 @@ class KVCRBindings:
     policy: "KVCachePolicy | None" = None
     inventory_mismatch_sink: InventoryMismatchSink | None = None
 
+    # Optional framework hook for additional source-owned transfer segments.
+    # It runs on KVCR's main thread after source descriptors and pin ownership
+    # are established, before the normal framework-DRAM write is submitted.
+    # Returning false fails the full operation instead of exposing a partial
+    # remote cache entry. Kept last to preserve the positional API of existing
+    # bindings clients.
+    prepare_extra_write: Callable[
+        [
+            str,
+            Collection[BlockKey],
+            Mapping[BlockKey, MemDescriptor],
+            Collection[PinHandle],
+        ],
+        bool,
+    ] | None = None
+
 
 class KVCR:
     """Framework-facing KV Cache Runner."""
@@ -156,9 +172,10 @@ class KVCR:
         self,
         blocks: Mapping[BlockKey, MemDescriptor],
         request_id: str | None = None,
+        operation_tag: str | None = None,
     ) -> OpHandle:
         """Asynchronously deliver blocks to caller-provided destinations."""
-        return self._core.deliver(blocks, request_id)
+        return self._core.deliver(blocks, request_id, operation_tag)
 
     def deposit(
         self,

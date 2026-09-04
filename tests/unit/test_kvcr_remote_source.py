@@ -414,6 +414,35 @@ def test_kvcr_source_async_transfer_error_notifies_failure():
     assert pinning.unpins == ["pin"]
 
 
+def test_rank_complete_source_hook_refuses_base_only_write() -> None:
+    """A tagged transfer must not write rank 0's row without the extra row."""
+    source_agent = FakeNixlAgent(metadata=b"source-md")
+    pinning = FakePrimaryPinning()
+    control = FakeBytesControl()
+    key = BlockKey(b"k0")
+    hook_calls = []
+    source = _new_kvcr(
+        source_agent,
+        pinning,
+        control,
+        name="source",
+        prepare_extra_write=lambda *args: hook_calls.append(args) or False,
+    )
+    control.incoming.append(_start_write_message(17, key, operation_tag="op-1"))
+
+    assert _poll_until(source, lambda _: bool(source_agent.sent_notifs)) == []
+    assert source_agent.xfers == []
+    assert pinning.unpins == ["pin"]
+    assert len(hook_calls) == 1
+    assert hook_calls[0][0] == "op-1"
+    assert _decode_notif(source_agent.sent_notifs[0][1]) == {
+        "type": "write_done",
+        "op_handle": 17,
+        "success": False,
+        "inventory_mismatch_reason": "rank_complete_prepare_failed",
+    }
+
+
 def test_kvcr_source_ignores_malformed_control_messages():
     """Garbage bytes or unknown payloads on the control PULL socket must not
     crash the scheduler thread and must not trigger side effects."""

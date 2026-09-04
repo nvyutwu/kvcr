@@ -67,6 +67,25 @@ def test_p2p_descriptor_fingerprints_cover_each_physical_group() -> None:
     assert _format_p2p_descriptor_fingerprints(keys, descriptors) != before
 
 
+def test_remote_target_forwards_rank_complete_operation_tag() -> None:
+    agent = FakeNixlAgent(metadata=b"target-md")
+    control = FakeBytesControl("tcp://target:1")
+    target = _new_kvcr(
+        agent,
+        FakePrimaryPinning(),
+        control,
+        KVCRConfig(nixl_agent_name="target"),
+        remote_options=RemoteFWDramOptions(eager_ctrl_connect=False),
+    )
+    key = BlockKey(b"tagged")
+    target.submit_hint((), src="tcp://source:1", request_id="req", hints="hint")
+
+    target.deliver({key: _mem_descriptor()}, request_id="req", operation_tag="op-1")
+
+    _wait_until(lambda: bool(control.sent))
+    assert _decode_control_message(control.sent[0][1])["operation_tag"] == "op-1"
+
+
 class _LogicalHashHintAdapter(_MatchingHintAdapter):
     def logical_key(self, key: BlockKey) -> bytes:
         return bytes(key[:-4])

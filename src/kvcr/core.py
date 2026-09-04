@@ -135,6 +135,7 @@ class _KVCRCore:
         self._poll_pin_results_callback = bindings.poll_pin_results
         self._release_pin_callback = bindings.release_pin
         self._cancel_pin_request_callback = bindings.cancel_pin_request
+        self._prepare_extra_write_callback = bindings.prepare_extra_write
         self.framework_control = bindings.framework_control
         self._inventory_sink_callback = bindings.inventory_sink
         self._inventory_mismatch_sink_callback = bindings.inventory_mismatch_sink
@@ -322,6 +323,7 @@ class _KVCRCore:
         self,
         blocks: Mapping[BlockKey, MemDescriptor],
         request_id: str | None = None,
+        operation_tag: str | None = None,
     ) -> OpHandle:
         op_handle = self._next_op_handle
         self._next_op_handle += 1
@@ -352,7 +354,11 @@ class _KVCRCore:
             )
         if remote_blocks:
             self._remote_fw_dram.deliver(
-                op_handle, remote_blocks, request_id, deadline=deadline
+                op_handle,
+                remote_blocks,
+                request_id,
+                operation_tag=operation_tag,
+                deadline=deadline,
             )
         elif not blocks:
             self._complete(op_handle, {})
