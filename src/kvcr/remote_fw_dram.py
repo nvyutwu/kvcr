@@ -11,7 +11,6 @@ Target: hint/query -> fetch/deliver -> start_write -> write_done.
 Source: start_write -> local claim/framework pin -> write -> write_done.
 """
 
-import ctypes
 import hashlib
 import math
 import os
@@ -55,8 +54,6 @@ if TYPE_CHECKING:
 _MEM_DESCRIPTORS_TYPE = tuple[MemDescriptor, ...]
 
 _P2P_DESCRIPTOR_DIAGNOSTICS_ENV = "KVCR_P2P_DESCRIPTOR_DIAGNOSTICS"
-_P2P_DESCRIPTOR_SAMPLE_BYTES = 64
-_P2P_DESCRIPTOR_SAMPLE_COUNT = 64
 _SOURCE_RESIDENCY_DIAGNOSTICS_ENV = "KVCR_SOURCE_RESIDENCY_DIAGNOSTICS"
 
 
@@ -118,51 +115,30 @@ def _format_source_residencies(
     return ",".join(entries)
 
 
-def _format_p2p_descriptor_fingerprints(
+def _format_p2p_descriptor_layout(
     keys: Collection[BlockKey], descriptors: Collection[MemDescriptor]
 ) -> str:
-    """Return deterministic, bounded fingerprints of aligned host-memory rows.
+    """Return a safe structural summary of aligned P2P descriptor rows.
 
-    This runs only behind ``KVCR_P2P_DESCRIPTOR_DIAGNOSTICS=1`` at call sites.
-    It samples at most 4 KiB per descriptor rather than logging or hashing cache
-    contents wholesale. The physical-group index and the target operation
-    handle in the caller are sufficient to correlate source and target rows.
+    ``MemDescriptor.addr`` is a transport-owned address and can become invalid
+    asynchronously.  Diagnostics must never dereference it: that would turn an
+    observation-only trace into a process crash.  Group index, descriptor size,
+    operation handle, and completion count are sufficient to correlate source
+    and target transport layout without exposing addresses or cache bytes.
     """
     pairs = tuple(zip(keys, descriptors))
     if len(pairs) != len(keys) or len(pairs) != len(descriptors):
         return "unaligned"
 
-    fingerprints: list[str] = []
+    layouts: list[str] = []
     for key, descriptor in pairs:
         group_idx = (
             int.from_bytes(bytes(key)[-4:], "big", signed=False)
             if len(key) >= 4
             else -1
         )
-        try:
-            sample_bytes = min(_P2P_DESCRIPTOR_SAMPLE_BYTES, descriptor.size)
-            sample_count = min(
-                _P2P_DESCRIPTOR_SAMPLE_COUNT,
-                max(1, math.ceil(descriptor.size / sample_bytes)),
-            )
-            final_offset = descriptor.size - sample_bytes
-            digest = hashlib.sha256()
-            for sample_index in range(sample_count):
-                offset = (
-                    0
-                    if sample_count == 1
-                    else final_offset * sample_index // (sample_count - 1)
-                )
-                digest.update(offset.to_bytes(8, "big", signed=False))
-                digest.update(ctypes.string_at(descriptor.addr + offset, sample_bytes))
-            fingerprints.append(
-                f"g{group_idx}:s{descriptor.size}:sha256={digest.hexdigest()}"
-            )
-        except (OverflowError, TypeError, ValueError):
-            # Diagnostics must never make a successful transfer fail. Valid
-            # production DRAM descriptors are expected to be readable.
-            fingerprints.append(f"g{group_idx}:s{descriptor.size}:unreadable")
-    return ",".join(fingerprints)
+        layouts.append(f"g{group_idx}:s{descriptor.size}")
+    return ",".join(layouts)
 
 
 @dataclass(slots=True)
@@ -298,12 +274,12 @@ class _TargetPullOp(_RemoteOp):
                     if key in completed_keys
                 )
                 logger.warning(
-                    "KVCR P2P descriptor fingerprints role=target_post_write "
+                    "KVCR P2P descriptor layout role=target_post_write "
                     "op=%d rows=%d/%d [%s]",
                     self.op_id[1],
                     len(completed_keys),
                     len(self.ordered_keys),
-                    _format_p2p_descriptor_fingerprints(
+                    _format_p2p_descriptor_layout(
                         tuple(
                             key for key in self.ordered_keys if key in completed_keys
                         ),
@@ -468,12 +444,12 @@ class _SourceWriteOp(_RemoteOp):
             try:
                 if _p2p_descriptor_diagnostics_enabled():
                     logger.warning(
-                        "KVCR P2P descriptor fingerprints role=source_pre_write "
+                        "KVCR P2P descriptor layout role=source_pre_write "
                         "op=%d rows=%d/%d [%s]",
                         self.op_handle,
                         self.completed_count,
                         len(self.ordered_keys),
-                        _format_p2p_descriptor_fingerprints(
+                        _format_p2p_descriptor_layout(
                             self.ordered_keys[: self.completed_count],
                             self.src_descriptors,
                         ),
