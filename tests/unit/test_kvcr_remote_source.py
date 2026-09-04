@@ -35,6 +35,7 @@ from kvcr import (
     TRANSFER_BYTES_METRIC,
 )
 from kvcr.config import KVCRConfig
+from kvcr.remote_fw_dram import _format_source_residencies
 from kvcr.types import BlockKey, PinRequestId
 
 
@@ -110,6 +111,24 @@ def test_kvcr_close_cleans_pending_pin_operations():
     assert not source._core._remote_fw_dram._source_pin_ops
     assert not source._core._remote_fw_dram._pending_pin_ops
     assert not source._core._framework_pin_keys
+
+
+def test_source_residency_trace_redacts_block_key_material() -> None:
+    source = _new_kvcr(
+        FakeNixlAgent(metadata=b"source-md"),
+        FakePrimaryPinning(),
+        FakeBytesControl(),
+        name="source",
+    )
+    key = BlockKey(b"sensitive-prefix-material" + (3).to_bytes(4, "big"))
+
+    trace = _format_source_residencies(source._core, (key,), {}, {})
+
+    assert "sensitive-prefix-material" not in trace
+    assert "g3" in trace
+    assert "source=missing" in trace
+
+    source.close()
 
 
 def test_kvcr_malformed_start_write_notifies_failure(kvcr_caplog):

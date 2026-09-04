@@ -57,11 +57,65 @@ _MEM_DESCRIPTORS_TYPE = tuple[MemDescriptor, ...]
 _P2P_DESCRIPTOR_DIAGNOSTICS_ENV = "KVCR_P2P_DESCRIPTOR_DIAGNOSTICS"
 _P2P_DESCRIPTOR_SAMPLE_BYTES = 64
 _P2P_DESCRIPTOR_SAMPLE_COUNT = 64
+_SOURCE_RESIDENCY_DIAGNOSTICS_ENV = "KVCR_SOURCE_RESIDENCY_DIAGNOSTICS"
 
 
 def _p2p_descriptor_diagnostics_enabled() -> bool:
     """Whether to sample P2P rows for a narrowly scoped transport diagnosis."""
     return os.environ.get(_P2P_DESCRIPTOR_DIAGNOSTICS_ENV) == "1"
+
+
+def _source_residency_diagnostics_enabled() -> bool:
+    """Whether to trace the source-side G2/framework ownership decision.
+
+    The trace emits only an ordinal and a one-way key fingerprint.  It never
+    emits a prompt, a complete block hash, an address, or cache bytes.
+    """
+    return os.environ.get(_SOURCE_RESIDENCY_DIAGNOSTICS_ENV) == "1"
+
+
+def _format_source_residencies(
+    kvcr: "_KVCRCore",
+    keys: Collection[BlockKey],
+    local_sources: Mapping[BlockKey, MemDescriptor],
+    framework_sources: Mapping[BlockKey, MemDescriptor],
+) -> str:
+    """Summarize source ownership for every requested physical group."""
+    entries: list[str] = []
+    for index, key in enumerate(keys):
+        record = kvcr._block_record_map.get(key)
+        local_state = (
+            "claimed"
+            if key in local_sources
+            else "none"
+            if record is None or record.local_dram is None
+            else record.local_dram.state.name.lower()
+        )
+        framework_state = (
+            "source"
+            if key in framework_sources
+            else "held"
+            if record is not None and record.fw_mem is not None
+            else "none"
+        )
+        source = (
+            "local"
+            if key in local_sources
+            else "framework"
+            if key in framework_sources
+            else "missing"
+        )
+        key_id = hashlib.sha256(bytes(key)).hexdigest()[-12:]
+        group_idx = (
+            int.from_bytes(bytes(key)[-4:], "big", signed=False)
+            if len(key) >= 4
+            else -1
+        )
+        entries.append(
+            f"i{index}:g{group_idx}:k{key_id}:source={source}:"
+            f"g2={local_state}:fw={framework_state}"
+        )
+    return ",".join(entries)
 
 
 def _format_p2p_descriptor_fingerprints(
@@ -1208,6 +1262,31 @@ class _RemoteFWDram:
             if key not in sources:
                 break
             completed_keys = source_pin.ordered_keys[: index + 1]
+        if _source_residency_diagnostics_enabled():
+            first_missing = len(completed_keys)
+            first_missing_label = (
+                first_missing
+                if first_missing < len(source_pin.ordered_keys)
+                else "none"
+            )
+            logger.info(
+                "KVCR source residency transition=resolved op=%s tag=%s "
+                "requested=%d local=%d framework=%d completed=%d "
+                "first_missing=%s states=[%s]",
+                op_id,
+                source_pin.operation_tag,
+                len(source_pin.ordered_keys),
+                len(local_sources),
+                len(framework_sources),
+                len(completed_keys),
+                first_missing_label,
+                _format_source_residencies(
+                    kvcr,
+                    source_pin.ordered_keys,
+                    local_sources,
+                    framework_sources,
+                ),
+            )
 
         logical_available_keys, logical_missing_keys = (
             self._partition_logical_representatives(
@@ -1444,6 +1523,22 @@ class _RemoteFWDram:
         unresolved_keys = tuple(
             key for key in op.ordered_keys if key not in local_sources
         )
+        if _source_residency_diagnostics_enabled():
+            logger.info(
+                "KVCR source residency transition=claim op=%s tag=%s "
+                "requested=%d local=%d unresolved=%d states=[%s]",
+                op.op_id,
+                op.operation_tag,
+                len(op.ordered_keys),
+                len(local_sources),
+                len(unresolved_keys),
+                _format_source_residencies(
+                    kvcr,
+                    op.ordered_keys,
+                    local_sources,
+                    {},
+                ),
+            )
         framework_sources = (
             self._acquire_framework_sources(unresolved_keys)
             if unresolved_keys
